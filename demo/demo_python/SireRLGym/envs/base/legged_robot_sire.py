@@ -1810,14 +1810,34 @@ class LeggedRobotSire(VecEnv):
         self._update_episode_diagnostics()
         self._post_physics_step_tasks()
         self.check_termination()
-        if forced_termination_ids is not None and len(forced_termination_ids) > 0:
+        has_forced_terminations = (
+            forced_termination_ids is not None
+            and len(forced_termination_ids) > 0
+        )
+        recovery_episode_sums = None
+        if has_forced_terminations:
             # Native output rows for these environments intentionally retain
-            # their previous finite state. Treat the transition as a terminal
-            # failure (not a timeout, so PPO does not bootstrap it), then let
-            # the ordinary per-environment reset path restore the simulator.
+            # their previous finite state. Treat a simulator failure as a
+            # truncation rather than an MDP terminal: rsl_rl then bootstraps
+            # from the value predicted for the last valid state instead of
+            # teaching the critic that an unrelated numerical fault has zero
+            # continuation value. The ordinary reset path still restores only
+            # the failed simulator.
             self.reset_buf[forced_termination_ids] = 1
-            self.time_out_buf[forced_termination_ids] = False
+            self.time_out_buf[forced_termination_ids] = True
+            # Preserve the episode accumulators from before this synthetic
+            # failure transition.  Reward functions describe valid physics;
+            # attributing a simulator fault to the policy contaminates the
+            # value target without providing a useful learning signal.
+            recovery_episode_sums = {
+                name: values[forced_termination_ids].clone()
+                for name, values in self.episode_sums.items()
+            }
         self.compute_reward()
+        if has_forced_terminations:
+            self.rew_buf[forced_termination_ids] = 0.0
+            for name, values in recovery_episode_sums.items():
+                self.episode_sums[name][forced_termination_ids] = values
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         self.reset_idx(env_ids)
         self.compute_observations()

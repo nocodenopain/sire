@@ -152,6 +152,53 @@ class SireBatchTrainingTest(unittest.TestCase):
         # Recovery leaves the batch usable on the immediately following step.
         env.step(actions)
 
+    def test_joint_divergence_is_recovered_without_reward_contamination(self):
+        env = _make_env()
+        actions = torch.zeros(env.num_envs, env.num_actions)
+        env.step(actions)
+        time_before = [loop.simTime() for loop in env.sire_sim_loops]
+
+        # This is finite, so it models the failure that previously escaped the
+        # NaN/Inf checks and made the unbounded dof_acc reward explode.
+        env.sire_models[1].motionPool()[0].mv = 3_000.0
+
+        _, _, rewards, dones, _ = env.step(actions)
+
+        self.assertFalse(bool(dones[0]))
+        self.assertTrue(bool(dones[1]))
+        self.assertEqual(float(rewards[1]), 0.0)
+        self.assertTrue(bool(env.extras["time_outs"][1]))
+        self.assertTrue(bool(torch.isfinite(rewards).all()))
+        self.assertEqual(env._sire_physics_failure_count, 1)
+        self.assertGreater(env.sire_sim_loops[0].simTime(), time_before[0])
+        self.assertAlmostEqual(env.sire_sim_loops[1].simTime(), 0.0)
+        self.assertTrue(
+            any(
+                "joint state exceeded configured safety bounds" in error
+                for error in env._sire_batch_stepper.recoverableErrors()
+            )
+        )
+        for values in env.episode_sums.values():
+            self.assertEqual(float(values[1]), 0.0)
+
+        # A numerical fault in one simulator must not poison or stop the batch.
+        env.step(actions)
+
+        # The companion position guard is deliberately wider than the normal
+        # mechanical clamp, so only an implausibly large excursion recovers.
+        upper = float(env.dof_pos_limits[0, 1])
+        env.sire_models[1].motionPool()[0].mp = upper + 1.01
+        _, _, rewards, dones, _ = env.step(actions)
+        self.assertTrue(bool(dones[1]))
+        self.assertEqual(float(rewards[1]), 0.0)
+        self.assertEqual(env._sire_physics_failure_count, 2)
+        self.assertTrue(
+            any(
+                "joint state exceeded configured safety bounds" in error
+                for error in env._sire_batch_stepper.recoverableErrors()
+            )
+        )
+
     def test_replay_history_is_opt_in_and_limited_to_one_env(self):
         env = _make_env()
         actions = torch.zeros(env.num_envs, env.num_actions)

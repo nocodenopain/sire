@@ -522,6 +522,10 @@ class SireRLBatchStepper {
   auto stepOne(std::size_t env_id, const float* actions) -> void {
     auto* loop = loops_[env_id];
     double last_dt = 0.0;
+    // Validate the state before it can enter contact handling as well as after
+    // every sub-step.  This is an RL adapter guard only: normal integration
+    // and contact solving are unchanged.
+    ensurePhysicsStateWithinSafetyBounds(env_id);
     while (!loop->headerIsCtrl()) {
       updateActuatorTorque(env_id, actions);
       const double before = loop->simTime();
@@ -652,7 +656,8 @@ class SireRLBatchStepper {
   }
 
   auto ensurePhysicsStateWithinSafetyBounds(std::size_t env_id) const -> void {
-    auto& base = models_[env_id]->partPool().at(1);
+    auto* model = models_[env_id];
+    auto& base = model->partPool().at(1);
     double pq[7]{0.0};
     double vs[6]{0.0};
     double vp[3]{0.0};
@@ -660,6 +665,30 @@ class SireRLBatchStepper {
     base.getVs(vs);
     aris::dynamic::s_vs2vp(vs, pq, vp);
     validatePhysicsState(pq, vs, vp);
+
+    // The Python environment already treats 100 rad/s as the Go2 joint
+    // velocity limit.  A one-radian margin beyond each mechanical position
+    // limit avoids changing the existing small-overshoot clamp in readState,
+    // while still catching a numerically exploded articulated state before it
+    // reaches another broadphase/contact solve or the RL reward buffers.
+    constexpr double kJointVelocitySafetyLimit = 100.0;
+    constexpr double kJointPositionSafetyMargin = 1.0;
+    auto& motion_pool = model->motionPool();
+    for (std::size_t dof_id = 0; dof_id < num_actions_; ++dof_id) {
+      const auto& motion = motion_pool.at(
+          static_cast<std::size_t>(motion_indices_[dof_id]));
+      const double position = motion.mp();
+      const double velocity = motion.mv();
+      if (!std::isfinite(position) || !std::isfinite(velocity)) {
+        throw std::runtime_error("joint state contains NaN or Inf");
+      }
+      if (std::abs(velocity) > kJointVelocitySafetyLimit ||
+          position < dof_lower_[dof_id] - kJointPositionSafetyMargin ||
+          position > dof_upper_[dof_id] + kJointPositionSafetyMargin) {
+        throw PhysicsSafetyBoundsError(
+            "joint state exceeded configured safety bounds");
+      }
+    }
   }
 
   static auto validatePhysicsState(const double* pq, const double* vs,
