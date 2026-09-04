@@ -76,6 +76,13 @@ class OnPolicyRunner:
         )
         self.visualize_interval = self.cfg.get('visualize_interval', None)
         self.visualize_resource_path = self.cfg.get('visualize_resource_path', None)
+        self.replay_history_enabled = (
+            self.visualize_interval is not None
+            or bool(getattr(self.env.cfg.sim, 'sire_diagnostics', False))
+        )
+        self.recording_policy_applied = self.env.set_sire_recording_env(
+            0 if self.replay_history_enabled else -1
+        )
         self.vis_dir = os.path.join(log_dir, 'vis') if log_dir else None
         if self.vis_dir:
             os.makedirs(self.vis_dir, exist_ok=True)
@@ -216,9 +223,10 @@ class OnPolicyRunner:
                 self.save(os.path.join(self.log_dir, f'model_{it}.pt'), iteration=it)
             if self.visualize_interval is not None and it % self.visualize_interval == 0:
                 self._save_recording(it)
-            # A PPO rollout boundary is not an episode boundary.  Preserve all
-            # simulator/model/timer state and clear only recorder storage.
-            self.env.resetSireRecorders()
+            if self.replay_history_enabled or not self.recording_policy_applied:
+                # A PPO rollout boundary is not an episode boundary. Preserve
+                # simulator/model/timer state and clear only replay storage.
+                self.env.resetSireRecorders()
             # Force GC to release pybind11-held C++ wrappers (motionPool, partPool, etc.)
             if it % 5 == 0:
                 gc.collect()

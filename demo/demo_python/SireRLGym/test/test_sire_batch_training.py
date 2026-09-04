@@ -128,6 +128,72 @@ class SireBatchTrainingTest(unittest.TestCase):
         for expected in ("env_id=1", "sim_time=", "pq=[", "mp=[", "actions=["):
             self.assertIn(expected, message)
 
+    def test_safety_bound_divergence_resets_only_failed_environment(self):
+        env = _make_env()
+        actions = torch.zeros(env.num_envs, env.num_actions)
+        env.step(actions)
+        time_before = [loop.simTime() for loop in env.sire_sim_loops]
+
+        failed_base = env.sire_models[1].partPool()[1]
+        failed_pq = list(failed_base.pq)
+        failed_pq[0] = 101.0
+        failed_base.pq = failed_pq
+
+        _, _, rewards, dones, _ = env.step(actions)
+
+        self.assertFalse(bool(dones[0]))
+        self.assertTrue(bool(dones[1]))
+        self.assertTrue(bool(torch.isfinite(rewards).all()))
+        self.assertEqual(env._sire_physics_failure_count, 1)
+        self.assertGreater(env.sire_sim_loops[0].simTime(), time_before[0])
+        self.assertAlmostEqual(env.sire_sim_loops[1].simTime(), 0.0)
+        self.assertTrue(bool(torch.isfinite(env.obs_buf).all()))
+
+        # Recovery leaves the batch usable on the immediately following step.
+        env.step(actions)
+
+    def test_replay_history_is_opt_in_and_limited_to_one_env(self):
+        env = _make_env()
+        actions = torch.zeros(env.num_envs, env.num_actions)
+
+        self.assertEqual(env._sire_batch_stepper.recordingEnv, -1)
+        env.step(actions)
+        # Pure RL keeps only the continuation placeholder required by the
+        # contact solver; it does not accumulate replay frames.
+        for loop in env.sire_sim_loops:
+            self.assertEqual(len(loop.recordsToJson()["timeIndex"]), 1)
+
+        env.set_sire_recording_env(0)
+        self.assertEqual(env._sire_batch_stepper.recordingEnv, 0)
+        env.reset()
+        env.step(actions)
+        self.assertGreater(
+            len(env.sire_sim_loops[0].recordsToJson()["timeIndex"]), 1
+        )
+        self.assertEqual(len(env.sire_sim_loops[1].recordsToJson()["timeIndex"]), 1)
+
+        env.set_sire_recording_env(-1)
+        self.assertEqual(env._sire_batch_stepper.recordingEnv, -1)
+        env.step(actions)
+        for loop in env.sire_sim_loops:
+            self.assertEqual(len(loop.recordsToJson()["timeIndex"]), 1)
+
+    def test_pure_rl_does_not_accumulate_contact_solver_debug_records(self):
+        env = _make_env(num_envs=2, threads=2)
+        actions = torch.zeros(env.num_envs, env.num_actions)
+
+        for _ in range(20):
+            env.step(actions)
+
+        # PsVsSolver3 owns this debug JSON independently of Recorder.  It used
+        # to append two samples per contact solve for every environment and was
+        # the remaining long-run RSS leak in batched RL.
+        self.assertTrue(bool(torch.any(env.foot_ground_contact)))
+        for loop in env.sire_sim_loops:
+            records = loop.recordsContactCptInfo() or {}
+            self.assertEqual(len(records.get("currentTime", [])), 0)
+            self.assertEqual(len(records.get("minTime", [])), 0)
+
     def test_terrain_boundary_is_a_per_env_timeout(self):
         env = _make_env(rough_terrain=True)
         env.contact_forces.zero_()

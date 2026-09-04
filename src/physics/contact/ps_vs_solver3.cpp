@@ -2043,8 +2043,20 @@ auto PsVsSolver3::cptContactSolverResult(
   double minTime = -1;
   DLOG(DEBUG) << " minTime: " << minTime << " b: " << b << " A: " << A
               << " x0: " << x0 << " stiffScale: " << stiffScale;
-  imp_->records["currentTime"].push_back(modelPtr->time());
-  imp_->records["minTime"].push_back(minTime);
+  // This is a diagnostic trace, separate from replay state.  In batched RL,
+  // Recorder history is disabled, so do not let one JSON array per environment
+  // grow for the entire training run.  Keep non-RL diagnostics available, but
+  // cap them just like PsVsSolver2.
+  auto* simulation_loop = enginePtr->simLoopPtr();
+  constexpr std::size_t kMaxDebugRecordCount = 4096;
+  if (simulation_loop != nullptr &&
+      simulation_loop->recorder().historyEnabled()) {
+    auto& current_time_records = imp_->records["currentTime"];
+    if (current_time_records.size() < kMaxDebugRecordCount) {
+      current_time_records.push_back(modelPtr->time());
+      imp_->records["minTime"].push_back(minTime);
+    }
+  }
   // 没有零点的情况下，取A中的最大值作为参考计算步长（修改为采用suggest_dt作为步长，不变result.dt）
   if (minTime <= 0 || minTime < 1e-6) {
     minTime = result.dt;

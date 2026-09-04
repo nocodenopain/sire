@@ -3,6 +3,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <functional>
 #include <iomanip>
@@ -28,6 +29,11 @@ namespace py = pybind11;
 using namespace pybind11::literals;
 
 namespace {
+
+class PhysicsSafetyBoundsError final : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
 
 class ParallelExecutor {
  public:
@@ -184,7 +190,6 @@ class SireRLBatchStepper {
         control_type_ != "T") {
       throw std::invalid_argument("control_type must be P, V, or T");
     }
-
     motion_indices_ = copyVector(motion_indices, "motion_indices");
     foot_part_ids_ = copyVector(foot_part_ids, "foot_part_ids");
     p_gains_ = copyVector(p_gains, "p_gains");
@@ -245,7 +250,10 @@ class SireRLBatchStepper {
           throw std::out_of_range("foot part id is outside the model partPool");
         }
       }
-      loop->recorder().setHistoryEnabled(env_id == 0);
+      // RL state only needs the lightweight latest-contact cache. Replay
+      // history is opt-in through setRecordingEnv(), keeping the established
+      // constructor signature compatible with existing Python callers.
+      loop->recorder().setHistoryEnabled(false);
       simulators_.push_back(simulator);
       models_.push_back(model);
       loops_.push_back(loop);
@@ -254,6 +262,7 @@ class SireRLBatchStepper {
 
     previous_dof_vel_.assign(num_envs_ * num_actions_, 0.0);
     errors_.resize(num_envs_);
+    recoverable_errors_.resize(num_envs_);
     allocateOutputs();
   }
 
@@ -274,12 +283,21 @@ class SireRLBatchStepper {
     }
     const auto* action_data = static_cast<const float*>(info.ptr);
     std::fill(errors_.begin(), errors_.end(), std::string{});
+    std::fill(recoverable_errors_.begin(), recoverable_errors_.end(),
+              std::string{});
 
     {
       py::gil_scoped_release release;
       executor_.run(num_envs_, [this, action_data](std::size_t env_id) {
         try {
           stepOne(env_id, action_data + env_id * num_actions_);
+        } catch (const PhysicsSafetyBoundsError& error) {
+          // A single independently simulated RL environment can occasionally
+          // diverge after a pathological contact. Preserve its previous
+          // finite output row so Python can terminate and reset only that
+          // episode. All other exception classes remain fail-fast below.
+          recoverable_errors_[env_id] = formatError(
+              env_id, error.what(), action_data + env_id * num_actions_);
         } catch (const std::exception& error) {
           errors_[env_id] = formatError(env_id, error.what(),
                                         action_data + env_id * num_actions_);
@@ -292,6 +310,24 @@ class SireRLBatchStepper {
 
     throwErrors("step");
     return outputs();
+  }
+
+  auto recoverableEnvIds() const -> std::vector<std::int64_t> {
+    std::vector<std::int64_t> ids;
+    for (std::size_t env_id = 0; env_id < recoverable_errors_.size(); ++env_id) {
+      if (!recoverable_errors_[env_id].empty()) {
+        ids.push_back(static_cast<std::int64_t>(env_id));
+      }
+    }
+    return ids;
+  }
+
+  auto recoverableErrors() const -> std::vector<std::string> {
+    std::vector<std::string> result;
+    for (const auto& error : recoverable_errors_) {
+      if (!error.empty()) result.push_back(error);
+    }
+    return result;
   }
 
   auto reset(py::array env_ids) -> void {
@@ -348,6 +384,20 @@ class SireRLBatchStepper {
     throwErrors("resetRecorders");
   }
 
+  auto setRecordingEnv(std::int64_t recording_env_id) -> void {
+    validateRecordingEnvId(recording_env_id);
+    for (std::size_t env_id = 0; env_id < num_envs_; ++env_id) {
+      loops_[env_id]->recorder().setHistoryEnabled(
+          recording_env_id >= 0 &&
+          env_id == static_cast<std::size_t>(recording_env_id));
+    }
+    recording_env_id_ = recording_env_id;
+  }
+
+  auto recordingEnv() const noexcept -> std::int64_t {
+    return recording_env_id_;
+  }
+
   auto outputs() const -> py::tuple {
     return py::make_tuple(root_states_, dof_pos_, dof_vel_, torques_,
                           contact_forces_, feet_pos_, body_ground_contact_,
@@ -366,6 +416,15 @@ class SireRLBatchStepper {
   auto numEnvs() const noexcept -> std::size_t { return num_envs_; }
 
  private:
+  auto validateRecordingEnvId(std::int64_t recording_env_id) const -> void {
+    if (recording_env_id < -1 ||
+        (recording_env_id >= 0 &&
+         static_cast<std::size_t>(recording_env_id) >= num_envs_)) {
+      throw std::out_of_range(
+          "recording_env_id must be -1 or a valid environment id");
+    }
+  }
+
   template <typename T>
   static auto copyVector(
       const py::array_t<T, py::array::c_style | py::array::forcecast>& array,
@@ -468,14 +527,18 @@ class SireRLBatchStepper {
       const double before = loop->simTime();
       loop->handleContact();
       last_dt = loop->simTime() - before;
+      // Contact integration can diverge within a sub-step. Check immediately
+      // so the next sub-step never feeds an already exploded pose into coal's
+      // broadphase tree before the per-environment recovery path can run.
+      ensurePhysicsStateWithinSafetyBounds(env_id);
     }
     updateActuatorTorque(env_id, actions);
     const double before = loop->simTime();
     loop->handleContact();
     last_dt = loop->simTime() - before;
+    ensurePhysicsStateWithinSafetyBounds(env_id);
     dt_actual_data_[env_id] = last_dt;
     readState(env_id);
-
   }
 
   auto resetRecorderForContinuation(std::size_t env_id) -> void {
@@ -497,21 +560,7 @@ class SireRLBatchStepper {
     base.getVs(vs);
     aris::dynamic::s_vs2vp(vs, pq, vp);
 
-    if (std::abs(pq[0]) > 100.0 || std::abs(pq[1]) > 100.0 ||
-        pq[2] < -5.0 || pq[2] > 50.0 || std::abs(vp[0]) > 100.0 ||
-        std::abs(vp[1]) > 100.0 || std::abs(vp[2]) > 100.0 ||
-        std::abs(vs[3]) > 100.0 || std::abs(vs[4]) > 100.0 ||
-        std::abs(vs[5]) > 100.0) {
-      throw std::runtime_error("physics state exceeded configured safety bounds");
-    }
-    for (double value : pq) {
-      if (!std::isfinite(value))
-        throw std::runtime_error("base pose contains NaN or Inf");
-    }
-    for (double value : vs) {
-      if (!std::isfinite(value))
-        throw std::runtime_error("base velocity contains NaN or Inf");
-    }
+    validatePhysicsState(pq, vs, vp);
 
     float* root = root_states_data_ + env_id * 13;
     for (std::size_t i = 0; i < 7; ++i) root[i] = static_cast<float>(pq[i]);
@@ -602,6 +651,37 @@ class SireRLBatchStepper {
     }
   }
 
+  auto ensurePhysicsStateWithinSafetyBounds(std::size_t env_id) const -> void {
+    auto& base = models_[env_id]->partPool().at(1);
+    double pq[7]{0.0};
+    double vs[6]{0.0};
+    double vp[3]{0.0};
+    base.getPq(pq);
+    base.getVs(vs);
+    aris::dynamic::s_vs2vp(vs, pq, vp);
+    validatePhysicsState(pq, vs, vp);
+  }
+
+  static auto validatePhysicsState(const double* pq, const double* vs,
+                                   const double* vp) -> void {
+    if (std::abs(pq[0]) > 100.0 || std::abs(pq[1]) > 100.0 ||
+        pq[2] < -5.0 || pq[2] > 50.0 || std::abs(vp[0]) > 100.0 ||
+        std::abs(vp[1]) > 100.0 || std::abs(vp[2]) > 100.0 ||
+        std::abs(vs[3]) > 100.0 || std::abs(vs[4]) > 100.0 ||
+        std::abs(vs[5]) > 100.0) {
+      throw PhysicsSafetyBoundsError(
+          "physics state exceeded configured safety bounds");
+    }
+    for (std::size_t i = 0; i < 7; ++i) {
+      if (!std::isfinite(pq[i]))
+        throw std::runtime_error("base pose contains NaN or Inf");
+    }
+    for (std::size_t i = 0; i < 6; ++i) {
+      if (!std::isfinite(vs[i]))
+        throw std::runtime_error("base velocity contains NaN or Inf");
+    }
+  }
+
   auto formatError(std::size_t env_id, const std::string& reason,
                    const float* actions) -> std::string {
     std::ostringstream message;
@@ -685,6 +765,7 @@ class SireRLBatchStepper {
   std::vector<double> dof_upper_;
   std::vector<double> previous_dof_vel_;
   std::vector<std::string> errors_;
+  std::vector<std::string> recoverable_errors_;
   ParallelExecutor executor_;
 
   py::array_t<float> root_states_;
@@ -705,6 +786,7 @@ class SireRLBatchStepper {
   bool* body_ground_contact_data_{nullptr};
   bool* foot_ground_contact_data_{nullptr};
   double* dt_actual_data_{nullptr};
+  std::int64_t recording_env_id_{-1};
 };
 
 }  // namespace
@@ -736,11 +818,16 @@ void init_rl(py::module& m) {
            "control_dt"_a,
            "sire_batch_threads"_a = 0)
       .def("step", &SireRLBatchStepper::step, "actions"_a)
+      .def("recoverableEnvIds", &SireRLBatchStepper::recoverableEnvIds)
+      .def("recoverableErrors", &SireRLBatchStepper::recoverableErrors)
       .def("reset", &SireRLBatchStepper::reset, "env_ids"_a)
       .def("resetRecorders", &SireRLBatchStepper::resetRecorders)
+      .def("setRecordingEnv", &SireRLBatchStepper::setRecordingEnv,
+           "recording_env_id"_a)
       .def("outputs", &SireRLBatchStepper::outputs)
       .def_property_readonly("threadCount", &SireRLBatchStepper::threadCount)
       .def_property_readonly("workerCount", &SireRLBatchStepper::workerCount)
       .def_property_readonly("dispatchCount", &SireRLBatchStepper::dispatchCount)
-      .def_property_readonly("numEnvs", &SireRLBatchStepper::numEnvs);
+      .def_property_readonly("numEnvs", &SireRLBatchStepper::numEnvs)
+      .def_property_readonly("recordingEnv", &SireRLBatchStepper::recordingEnv);
 }

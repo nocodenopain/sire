@@ -491,6 +491,7 @@ def main():
     if use_sire:
         from SireRLGym.envs.base.legged_robot_sire import LeggedRobotSire
         env = LeggedRobotSire(env_cfg, headless=args.headless)
+        env.set_sire_recording_env(0 if args.meshcat else -1)
     else:
         from SireRLGym.utils.task_registry import make_env_from_cfg
         env = make_env_from_cfg(args.task, env_cfg, headless=args.headless)

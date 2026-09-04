@@ -107,6 +107,11 @@ class LeggedRobotSire(VecEnv):
             self.device
         ).contiguous()
         outputs = self._sire_batch_stepper.step(self.actions.numpy())
+        recoverable_env_ids = self._sire_batch_stepper.recoverableEnvIds()
+        if recoverable_env_ids:
+            self._sire_physics_failure_count += len(recoverable_env_ids)
+            for error in self._sire_batch_stepper.recoverableErrors():
+                print(f"[Sire recovery] {error}", flush=True)
         (
             root_states,
             dof_pos,
@@ -132,7 +137,13 @@ class LeggedRobotSire(VecEnv):
         self.root_states[:, :3] -= self._physics_origins
         self.feet_pos_world -= self._physics_origins.unsqueeze(1)
 
-        self._post_physics_step_sire(refresh_from_sire=False)
+        recovery_ids = torch.as_tensor(
+            recoverable_env_ids, dtype=torch.long, device=self.device
+        )
+        self._post_physics_step_sire(
+            refresh_from_sire=False,
+            forced_termination_ids=recovery_ids,
+        )
         return self._clip_and_collect_step_result()
 
     def legacySireStep(self, actions):
@@ -1002,6 +1013,18 @@ class LeggedRobotSire(VecEnv):
             float(self.dt),
             sire_batch_threads,
         )
+        self._sire_recording_control_supported = hasattr(
+            self._sire_batch_stepper, "setRecordingEnv"
+        )
+        if not hasattr(self._sire_batch_stepper, "recoverableEnvIds"):
+            raise RuntimeError(
+                "the loaded Sire extension lacks per-environment physics "
+                "recovery support; rebuild the extension"
+            )
+        self._sire_physics_failure_count = 0
+        self.setSireRecordingEnv(
+            int(getattr(self.cfg.sim, "sire_recording_env_id", -1))
+        )
         # Public spelling requested by the training CLI/config.  It reports
         # the effective count after clamping to num_envs.
         self.sireBatchThread = self._sire_batch_stepper.threadCount
@@ -1729,6 +1752,29 @@ class LeggedRobotSire(VecEnv):
     def reset_sire_recorders(self):
         return self.resetSireRecorders()
 
+    def setSireRecordingEnv(self, recording_env_id=-1):
+        """Select one environment for replay history, or -1 to disable it."""
+        recording_env_id = int(recording_env_id)
+        if recording_env_id < -1 or recording_env_id >= self.num_envs:
+            raise ValueError(
+                "recording_env_id must be -1 or a valid environment id"
+            )
+        if self._sire_recording_control_supported:
+            self._sire_batch_stepper.setRecordingEnv(recording_env_id)
+            return True
+        # Compatibility with an extension built before setRecordingEnv was
+        # added. That implementation always records env 0, so callers must
+        # continue clearing it at rollout boundaries to keep memory bounded.
+        if recording_env_id not in (-1, 0):
+            raise RuntimeError(
+                "the loaded Sire extension only supports recording env 0; "
+                "rebuild it to select another environment"
+            )
+        return False
+
+    def set_sire_recording_env(self, recording_env_id=-1):
+        return self.setSireRecordingEnv(recording_env_id)
+
     def get_observations(self):
         return self.obs_buf
 
@@ -1740,7 +1786,9 @@ class LeggedRobotSire(VecEnv):
     # ------------------------------------------------------------------
     #  Post physics step (calls _refresh_sim_tensors_sire)
     # ------------------------------------------------------------------
-    def _post_physics_step_sire(self, refresh_from_sire=True):
+    def _post_physics_step_sire(
+        self, refresh_from_sire=True, forced_termination_ids=None
+    ):
         self.extras = {}
         self.episode_length_buf += 1
         self.common_step_counter += 1
@@ -1762,6 +1810,13 @@ class LeggedRobotSire(VecEnv):
         self._update_episode_diagnostics()
         self._post_physics_step_tasks()
         self.check_termination()
+        if forced_termination_ids is not None and len(forced_termination_ids) > 0:
+            # Native output rows for these environments intentionally retain
+            # their previous finite state. Treat the transition as a terminal
+            # failure (not a timeout, so PPO does not bootstrap it), then let
+            # the ordinary per-environment reset path restore the simulator.
+            self.reset_buf[forced_termination_ids] = 1
+            self.time_out_buf[forced_termination_ids] = False
         self.compute_reward()
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         self.reset_idx(env_ids)

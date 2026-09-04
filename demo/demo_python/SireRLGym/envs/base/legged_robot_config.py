@@ -183,6 +183,9 @@ class LeggedRobotCfg(BaseConfig):
         # 0 selects min(os.cpu_count(), num_envs). The executor persists for
         # the full environment lifetime and includes the calling thread.
         sire_batch_threads = 0
+        # Full Recorder history is expensive and is not needed for RL state.
+        # Use -1 to disable it, or select one environment for replay export.
+        sire_recording_env_id = -1
         sire_diagnostics = False
         gravity = [0.0, 0.0, -9.81]
         up_axis = 1
