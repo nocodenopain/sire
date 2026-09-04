@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import statistics
@@ -13,29 +14,89 @@ import torch
 import yaml
 
 try:
-    from torch.utils.tensorboard import SummaryWriter
+    from torch.utils.tensorboard import SummaryWriter as _TensorBoardSummaryWriter
 except ModuleNotFoundError as error:
     if error.name != "tensorboard":
         raise
+    _TensorBoardSummaryWriter = None
 
-    class SummaryWriter:  # type: ignore[no-redef]
-        """No-op writer used when the optional TensorBoard package is absent."""
 
-        def __init__(self, *args, **kwargs):
+class PersistentSummaryWriter:
+    """Write TensorBoard events and an always-available scalar JSONL stream."""
+
+    def __init__(self, log_dir, flush_secs=10, tensorboard_writer_cls=None):
+        self.log_dir = str(log_dir)
+        Path(self.log_dir).mkdir(parents=True, exist_ok=True)
+        self.metrics_path = os.path.join(self.log_dir, 'metrics.jsonl')
+        self._metrics_file = open(self.metrics_path, 'a', encoding='utf-8', buffering=1)
+        self._closed = False
+        if tensorboard_writer_cls is False:
+            tensorboard_writer_cls = None
+        elif tensorboard_writer_cls is None:
+            tensorboard_writer_cls = _TensorBoardSummaryWriter
+        self._tensorboard = (
+            tensorboard_writer_cls(log_dir=self.log_dir, flush_secs=flush_secs)
+            if tensorboard_writer_cls is not None
+            else None
+        )
+        if self._tensorboard is None:
             print(
-                "[Sire training] tensorboard is not installed; file-based "
-                "scalar logging is disabled.",
+                "[Sire training] tensorboard is not installed; metrics remain "
+                f"available at {self.metrics_path}. Install the declared "
+                "tensorboard dependency to also create event files.",
+                flush=True,
+            )
+        else:
+            print(
+                f"[Sire training] TensorBoard log_dir={self.log_dir}; "
+                f"scalar_backup={self.metrics_path}",
                 flush=True,
             )
 
-        def add_scalar(self, *args, **kwargs):
-            return None
+    @property
+    def tensorboard_enabled(self):
+        return self._tensorboard is not None
 
-        def flush(self):
-            return None
+    @staticmethod
+    def _as_float(value):
+        if isinstance(value, torch.Tensor):
+            value = value.detach().item()
+        return float(value)
 
-        def close(self):
-            return None
+    def add_scalar(self, tag, scalar_value, global_step=None, walltime=None):
+        if self._closed:
+            raise RuntimeError('cannot write to a closed training metric writer')
+        scalar = self._as_float(scalar_value)
+        timestamp = time.time() if walltime is None else float(walltime)
+        if self._tensorboard is not None:
+            self._tensorboard.add_scalar(
+                tag, scalar, global_step=global_step, walltime=timestamp
+            )
+        record = {
+            'wall_time': timestamp,
+            'step': global_step,
+            'tag': str(tag),
+            'value': scalar if math.isfinite(scalar) else None,
+        }
+        if not math.isfinite(scalar):
+            record['nonfinite_value'] = str(scalar)
+        self._metrics_file.write(json.dumps(record, separators=(',', ':')) + '\n')
+
+    def flush(self):
+        if self._closed:
+            return
+        self._metrics_file.flush()
+        if self._tensorboard is not None:
+            self._tensorboard.flush()
+
+    def close(self):
+        if self._closed:
+            return
+        self.flush()
+        if self._tensorboard is not None:
+            self._tensorboard.close()
+        self._metrics_file.close()
+        self._closed = True
 
 from rsl_rl.algorithms import PPO
 from rsl_rl.modules import ActorCritic
@@ -143,7 +204,9 @@ class OnPolicyRunner:
 
     def learn(self, num_learning_iterations, init_at_random_ep_len=False):
         if self.log_dir is not None and self.writer is None:
-            self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
+            self.writer = PersistentSummaryWriter(
+                log_dir=self.log_dir, flush_secs=10
+            )
         if self.infinite_scheduler is not None:
             self.infinite_scheduler.initialize(self.current_learning_iteration, self.tot_time, self.tot_timesteps)
 
@@ -171,6 +234,11 @@ class OnPolicyRunner:
         while self.infinite_mode or it < total_iterations:
             it += 1
             start = time.time()
+            max_abs_dof_velocity = 0.0
+            physics_failures_before = int(
+                getattr(self.env, '_sire_physics_failure_count', 0)
+            )
+            iteration_episode_returns = []
 
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
@@ -185,6 +253,11 @@ class OnPolicyRunner:
                     obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
                     rewards, dones = rewards.to(self.device), dones.to(self.device)
                     self.alg.process_env_step(rewards, dones, infos)
+                    if hasattr(self.env, 'dof_vel'):
+                        max_abs_dof_velocity = max(
+                            max_abs_dof_velocity,
+                            float(self.env.dof_vel.detach().abs().max().item()),
+                        )
 
                     if self.log_dir is not None:
                         if 'episode' in infos:
@@ -192,7 +265,9 @@ class OnPolicyRunner:
                         cur_reward_sum += rewards
                         cur_episode_length += 1
                         new_ids = (dones > 0).nonzero(as_tuple=False)
-                        rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                        completed_returns = cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist()
+                        rewbuffer.extend(completed_returns)
+                        iteration_episode_returns.extend(completed_returns)
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
                         cur_reward_sum[new_ids] = 0
                         cur_episode_length[new_ids] = 0
@@ -201,19 +276,31 @@ class OnPolicyRunner:
                 collection_time = stop - start
                 start = stop
                 self.alg.compute_returns(critic_obs)
+                rollout_diagnostics = self._capture_rollout_diagnostics()
 
             update_out = self.alg.update()
             if isinstance(update_out, tuple):
                 mean_value_loss = update_out[0]
                 mean_surrogate_loss = update_out[1]
-                mean_entropy = update_out[2] if len(update_out) > 2 else 0.0
-                # update_out[3] = mean_rnd_loss (unused)
-                mean_sym_loss = update_out[4] if len(update_out) > 4 else None
+                if len(update_out) == 3:
+                    # The repository-pinned rsl_rl PPO returns
+                    # (value_loss, surrogate_loss, symmetry_loss).
+                    mean_entropy = self._policy_entropy()
+                    mean_sym_loss = update_out[2]
+                else:
+                    # Newer rsl_rl versions return entropy and optionally RND
+                    # before symmetry loss.
+                    mean_entropy = update_out[2] if len(update_out) > 2 else self._policy_entropy()
+                    mean_sym_loss = update_out[4] if len(update_out) > 4 else None
             else:
                 mean_value_loss = update_out
                 mean_surrogate_loss = 0.0
-                mean_entropy = 0.0
+                mean_entropy = self._policy_entropy()
                 mean_sym_loss = None
+            optimizer_diagnostics = self._capture_optimizer_diagnostics()
+            physics_recoveries = int(
+                getattr(self.env, '_sire_physics_failure_count', 0)
+            ) - physics_failures_before
             stop = time.time()
             learn_time = stop - start
 
@@ -249,8 +336,83 @@ class OnPolicyRunner:
 
         self.current_learning_iteration = it
         self.save(os.path.join(self.log_dir, f'model_{self.current_learning_iteration}.pt'), iteration=self.current_learning_iteration)
+        if self.writer is not None:
+            self.writer.flush()
         # if self.visualize_interval is not None:
         #     self._visualize_end()
+
+    @staticmethod
+    def _stats(prefix, tensor):
+        values = tensor.detach().float()
+        if values.numel() == 0:
+            return {}
+        finite = torch.isfinite(values)
+        result = {f'{prefix}_nonfinite_count': float((~finite).sum().item())}
+        if not bool(finite.any()):
+            return result
+        values = values[finite]
+        result.update(
+            {
+                f'{prefix}_mean': float(values.mean().item()),
+                f'{prefix}_std': float(values.std(unbiased=False).item()),
+                f'{prefix}_min': float(values.min().item()),
+                f'{prefix}_max': float(values.max().item()),
+                f'{prefix}_abs_max': float(values.abs().max().item()),
+            }
+        )
+        return result
+
+    def _capture_rollout_diagnostics(self):
+        storage = self.alg.storage
+        steps = int(storage.step)
+        diagnostics = {}
+        if steps <= 0:
+            return diagnostics
+        rewards = storage.rewards[:steps]
+        values = storage.values[:steps]
+        returns = storage.returns[:steps]
+        diagnostics.update(self._stats('reward', rewards))
+        diagnostics.update(self._stats('value', values))
+        diagnostics.update(self._stats('return', returns))
+        diagnostics.update(self._stats('raw_advantage', returns - values))
+        return diagnostics
+
+    def _capture_optimizer_diagnostics(self):
+        totals = {
+            'actor_adam_second_moment_max': 0.0,
+            'critic_adam_second_moment_max': 0.0,
+            'other_adam_second_moment_max': 0.0,
+            'last_gradient_abs_max': 0.0,
+        }
+        for name, parameter in self.alg.actor_critic.named_parameters():
+            if parameter.grad is not None:
+                totals['last_gradient_abs_max'] = max(
+                    totals['last_gradient_abs_max'],
+                    float(parameter.grad.detach().abs().max().item()),
+                )
+            state = self.alg.optimizer.state.get(parameter, {})
+            second_moment = state.get('exp_avg_sq')
+            if second_moment is None or second_moment.numel() == 0:
+                continue
+            if name.startswith('actor.'):
+                key = 'actor_adam_second_moment_max'
+            elif name.startswith('critic.'):
+                key = 'critic_adam_second_moment_max'
+            else:
+                key = 'other_adam_second_moment_max'
+            totals[key] = max(
+                totals[key], float(second_moment.detach().max().item())
+            )
+        return totals
+
+    def _policy_entropy(self):
+        std = self.alg.actor_critic.std.detach().float().clamp_min(1e-12)
+        return float((torch.log(std) + 0.5 * math.log(2.0 * math.pi * math.e)).sum().item())
+
+    def close(self):
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None
 
     def log(self, locs, width=80, pad=35):
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
@@ -280,6 +442,7 @@ class OnPolicyRunner:
         self.writer.add_scalar('Loss/value_function', locs['mean_value_loss'], locs['it'])
         self.writer.add_scalar('Loss/surrogate', locs['mean_surrogate_loss'], locs['it'])
         self.writer.add_scalar('Loss/entropy', locs['mean_entropy'], locs['it'])
+        self.writer.add_scalar('Loss/learning_rate', self.alg.learning_rate, locs['it'])
         if locs.get('mean_sym_loss') is not None:
             self.writer.add_scalar('Loss/symmetry', locs['mean_sym_loss'], locs['it'])
         mean_std = self.alg.actor_critic.std.mean()
@@ -292,6 +455,29 @@ class OnPolicyRunner:
             self.writer.add_scalar('Train/mean_episode_length', statistics.mean(locs['lenbuffer']), locs['it'])
             self.writer.add_scalar('Train/mean_reward/time', statistics.mean(locs['rewbuffer']), self.tot_time)
             self.writer.add_scalar('Train/mean_episode_length/time', statistics.mean(locs['lenbuffer']), self.tot_time)
+        if locs.get('iteration_episode_returns'):
+            returns = locs['iteration_episode_returns']
+            self.writer.add_scalar('Diagnostics/episode_return_min', min(returns), locs['it'])
+            self.writer.add_scalar('Diagnostics/episode_return_max', max(returns), locs['it'])
+        self.writer.add_scalar(
+            'Diagnostics/dof_velocity_abs_max',
+            locs.get('max_abs_dof_velocity', 0.0),
+            locs['it'],
+        )
+        self.writer.add_scalar(
+            'Diagnostics/physics_recoveries',
+            locs.get('physics_recoveries', 0),
+            locs['it'],
+        )
+        self.writer.add_scalar(
+            'Diagnostics/physics_recoveries_total',
+            int(getattr(self.env, '_sire_physics_failure_count', 0)),
+            locs['it'],
+        )
+        for key, value in locs.get('rollout_diagnostics', {}).items():
+            self.writer.add_scalar(f'Diagnostics/{key}', value, locs['it'])
+        for key, value in locs.get('optimizer_diagnostics', {}).items():
+            self.writer.add_scalar(f'Optimizer/{key}', value, locs['it'])
         if self.debug_reward and isinstance(getattr(self.env, 'reward_debug_info', None), dict):
             for k, v in self.env.reward_debug_info.items():
                 self.writer.add_scalar(f'RewardDebug/{k}', float(v), locs['it'])
@@ -371,6 +557,7 @@ class OnPolicyRunner:
         # regular file.  Flush once per PPO iteration so progress is visible
         # immediately without restoring the expensive per-scalar CSV writer.
         print(log_string, flush=True)
+        self.writer.flush()
 
     def save(self, path, iteration=None):
         if iteration is None:

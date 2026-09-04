@@ -264,7 +264,12 @@ def main():
         f"target={target_iteration} remaining={remaining_iterations}",
         flush=True,
     )
-    runner.learn(remaining_iterations)
+    try:
+        runner.learn(remaining_iterations)
+    finally:
+        # Persist the latest complete iteration even when native simulation or
+        # PPO raises before training reaches its requested target.
+        runner.close()
 
 
 if __name__ == '__main__':
