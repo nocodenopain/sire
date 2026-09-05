@@ -526,6 +526,7 @@ class SireRLBatchStepper {
     // every sub-step.  This is an RL adapter guard only: normal integration
     // and contact solving are unchanged.
     ensurePhysicsStateWithinSafetyBounds(env_id);
+    clampJointStateToLimits(env_id);
     while (!loop->headerIsCtrl()) {
       updateActuatorTorque(env_id, actions);
       const double before = loop->simTime();
@@ -535,12 +536,14 @@ class SireRLBatchStepper {
       // so the next sub-step never feeds an already exploded pose into coal's
       // broadphase tree before the per-environment recovery path can run.
       ensurePhysicsStateWithinSafetyBounds(env_id);
+      clampJointStateToLimits(env_id);
     }
     updateActuatorTorque(env_id, actions);
     const double before = loop->simTime();
     loop->handleContact();
     last_dt = loop->simTime() - before;
     ensurePhysicsStateWithinSafetyBounds(env_id);
+    clampJointStateToLimits(env_id);
     dt_actual_data_[env_id] = last_dt;
     readState(env_id);
   }
@@ -652,6 +655,23 @@ class SireRLBatchStepper {
     for (std::size_t foot_id = 0; foot_id < num_feet_; ++foot_id) {
       foot_contact[foot_id] =
           body_contact[static_cast<std::size_t>(foot_part_ids_[foot_id])];
+    }
+  }
+
+  auto clampJointStateToLimits(std::size_t env_id) const -> void {
+    auto& motion_pool = models_[env_id]->motionPool();
+    for (std::size_t dof_id = 0; dof_id < num_actions_; ++dof_id) {
+      auto& motion = motion_pool.at(
+          static_cast<std::size_t>(motion_indices_[dof_id]));
+      double position = motion.mp();
+      double velocity = motion.mv();
+      if (position < dof_lower_[dof_id]) {
+        motion.setMp(dof_lower_[dof_id]);
+        if (velocity < 0.0) motion.setMv(0.0);
+      } else if (position > dof_upper_[dof_id]) {
+        motion.setMp(dof_upper_[dof_id]);
+        if (velocity > 0.0) motion.setMv(0.0);
+      }
     }
   }
 

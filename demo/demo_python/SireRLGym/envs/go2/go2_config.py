@@ -87,6 +87,11 @@ class GO2RoughCfg(LeggedRobotCfg):
         base_height_target = 0.34
 
         class scales(LeggedRobotCfg.rewards.scales):
+            # Reward scales are integrated over the 20 ms control interval.
+            # -50 therefore gives an actual -1 reward for an ordinary fall,
+            # while time-limit and recoverable simulator truncations remain
+            # excluded by _reward_termination().
+            termination = -50.0
             torques = -0.0001
             dof_pos_limits = -10.0
             action_rate = -0.01

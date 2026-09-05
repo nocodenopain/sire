@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -43,6 +44,16 @@ def parse_args():
     p.add_argument('--task', type=str, default='go2')
     p.add_argument('--num_envs', type=int, default=None)
     p.add_argument(
+        '--sim_dt',
+        type=float,
+        default=None,
+        help=(
+            'Override the Sire physics step while preserving the task control '
+            'period by adjusting control.decimation (for Go2, 0.005 selects '
+            '4 substeps at the existing 20 ms control period).'
+        ),
+    )
+    p.add_argument(
         '--sire_batch_threads', '--sirebatchthread',
         dest='sire_batch_threads', type=int, default=None,
         help='Persistent Sire batch thread count; 0 selects an automatic value.',
@@ -78,6 +89,30 @@ def parse_args():
     p.add_argument('--visualize_resource_path', type=str, default=None,
                    help='Resource directory for meshcat visual assets (default: auto-detect from model)')
     return p.parse_args()
+
+
+def _apply_sim_dt_override(env_cfg, sim_dt):
+    if sim_dt is None:
+        return
+    sim_dt = float(sim_dt)
+    if not math.isfinite(sim_dt) or sim_dt <= 0.0:
+        raise ValueError('--sim_dt must be finite and > 0')
+
+    old_sim_dt = float(env_cfg.sim.dt)
+    old_decimation = int(env_cfg.control.decimation)
+    control_dt = old_sim_dt * old_decimation
+    decimation_float = control_dt / sim_dt
+    decimation = int(round(decimation_float))
+    if decimation < 1 or not math.isclose(
+        sim_dt * decimation, control_dt, rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise ValueError(
+            f'--sim_dt={sim_dt:g} cannot preserve the configured {control_dt:g}s '
+            'control period with an integer decimation'
+        )
+
+    env_cfg.sim.dt = sim_dt
+    env_cfg.control.decimation = decimation
 
 
 def _resolve_resume_path(resume_arg, train_cfg):
@@ -128,6 +163,15 @@ def main():
     args = parse_args()
     env_cfg = make_env_cfg(args.task)
     train_cfg = make_train_cfg(args.task)
+
+    _apply_sim_dt_override(env_cfg, args.sim_dt)
+    print(
+        'train_timing '
+        f'sim_dt={float(env_cfg.sim.dt):g} '
+        f'decimation={int(env_cfg.control.decimation)} '
+        f'control_dt={float(env_cfg.sim.dt) * int(env_cfg.control.decimation):g}',
+        flush=True,
+    )
 
     if args.num_envs is not None:
         env_cfg.env.num_envs = args.num_envs

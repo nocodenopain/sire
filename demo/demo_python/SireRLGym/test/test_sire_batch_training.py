@@ -51,6 +51,18 @@ def _snapshot(env):
 
 
 class SireBatchTrainingTest(unittest.TestCase):
+    def test_go2_fall_penalty_excludes_timeout_transitions(self):
+        env = _make_env()
+        env.reset_buf[:] = 1
+        env.time_out_buf[:] = torch.tensor([False, True])
+
+        termination_reward = (
+            env._reward_termination() * env.reward_scales["termination"]
+        )
+
+        self.assertAlmostEqual(float(termination_reward[0]), -1.0)
+        self.assertAlmostEqual(float(termination_reward[1]), 0.0)
+
     def test_batch_matches_legacy_step_and_reuses_outputs(self):
         # One environment isolates implementation equivalence from any
         # underlying solver-level cross-thread nondeterminism.
@@ -198,6 +210,37 @@ class SireBatchTrainingTest(unittest.TestCase):
                 for error in env._sire_batch_stepper.recoverableErrors()
             )
         )
+
+    def test_go2_calf_limits_are_enforced_before_each_substep(self):
+        env = _make_env()
+        actions = torch.zeros(env.num_envs, env.num_actions)
+
+        calf_ids = [
+            i for i, name in enumerate(env.dof_names) if "calf_joint" in name
+        ]
+        self.assertEqual(len(calf_ids), 4)
+        for dof_id in calf_ids:
+            self.assertAlmostEqual(
+                float(env.dof_pos_limits[dof_id, 1]), -0.83776, places=5
+            )
+
+        # Sire does not currently import MJCF joint constraints.  A moderate
+        # finite overshoot is therefore clamped by the RL adapter before it
+        # can enter another 5 ms contact solve; truly divergent states still
+        # take the recoverable-error path covered by the preceding test.
+        dof_id = calf_ids[0]
+        motion_id = int(env._motion_idx[dof_id])
+        upper = float(env.dof_pos_limits[dof_id, 1])
+        motion = env.sire_models[1].motionPool()[motion_id]
+        motion.mp = upper + 0.25
+        motion.mv = 10.0
+
+        failures_before = env._sire_physics_failure_count
+        _, _, _, dones, _ = env.step(actions)
+
+        self.assertFalse(bool(dones[1]))
+        self.assertEqual(env._sire_physics_failure_count, failures_before)
+        self.assertLessEqual(float(env.dof_pos[1, dof_id]), upper + 1e-6)
 
     def test_replay_history_is_opt_in_and_limited_to_one_env(self):
         env = _make_env()

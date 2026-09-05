@@ -1303,19 +1303,21 @@ class LeggedRobotSire(VecEnv):
         # These values are from the Go2 MuJoCo model and match the actual
         # Unitree Go2 mechanical specs.
         _GO2_JOINT_LIMITS = {
-            # hip: ±1.0472 rad (60°), thigh: [-1.5708, 3.4907], calf: [-2.7227, 0.83776]
+            # hip: ±1.0472 rad (60°), thigh: [-1.5708, 3.4907],
+            # calf: [-2.7227, -0.83776].  Keep the calf upper bound negative,
+            # matching all four joints in resources/robots/go2/go2.xml.
             "FL_hip_joint":   [-1.0472, 1.0472, 23.7],
             "FL_thigh_joint": [-1.5708, 3.4907, 23.7],
-            "FL_calf_joint":  [-2.7227, 0.83776, 35.55],
+            "FL_calf_joint":  [-2.7227, -0.83776, 35.55],
             "FR_hip_joint":   [-1.0472, 1.0472, 23.7],
             "FR_thigh_joint": [-1.5708, 3.4907, 23.7],
-            "FR_calf_joint":  [-2.7227, 0.83776, 35.55],
+            "FR_calf_joint":  [-2.7227, -0.83776, 35.55],
             "RL_hip_joint":   [-1.0472, 1.0472, 23.7],
             "RL_thigh_joint": [-0.5236, 4.5379, 23.7],
-            "RL_calf_joint":  [-2.7227, 0.83776, 35.55],
+            "RL_calf_joint":  [-2.7227, -0.83776, 35.55],
             "RR_hip_joint":   [-1.0472, 1.0472, 23.7],
             "RR_thigh_joint": [-0.5236, 4.5379, 23.7],
-            "RR_calf_joint":  [-2.7227, 0.83776, 35.55],
+            "RR_calf_joint":  [-2.7227, -0.83776, 35.55],
         }
         limits_list = []
         torque_list = []
