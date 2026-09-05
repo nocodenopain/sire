@@ -14,7 +14,12 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from RLGym.utils.math import quat_apply, quat_rotate_inverse, wrap_to_pi
+from RLGym.utils.math import (
+    mujoco_free_joint_velocity_to_base,
+    quat_apply,
+    quat_rotate_inverse,
+    wrap_to_pi,
+)
 from RLGym.scene_curriculum import apply_scene_curriculum_to_env_cfg, build_scene_curriculum_from_npz, resolve_scene_npz
 from RLGym.utils.joint_order import JointOrderAdapter, infer_checkpoint_privileged_obs_dim
 from RLGym.utils.task_registry import make_env_cfg, make_env_from_cfg
@@ -139,8 +144,11 @@ def _apply_fixed_start_state(env):
 
     env._refresh_sim_tensors()
     env.base_quat[:] = env.root_states[:, 3:7]
-    env.base_lin_vel[:] = quat_rotate_inverse(env.base_quat, env.root_states[:, 7:10])
-    env.base_ang_vel[:] = quat_rotate_inverse(env.base_quat, env.root_states[:, 10:13])
+    base_lin_vel, base_ang_vel = mujoco_free_joint_velocity_to_base(
+        env.base_quat, env.root_states[:, 7:13]
+    )
+    env.base_lin_vel[:] = base_lin_vel
+    env.base_ang_vel[:] = base_ang_vel
     env.projected_gravity[:] = quat_rotate_inverse(env.base_quat, env.gravity_vec)
     if env.cfg.terrain.measure_heights:
         env.measured_heights = env._get_heights()
@@ -188,8 +196,11 @@ def _deployment_step(env, actions: torch.Tensor):
 
     env._refresh_sim_tensors()
     env.base_quat[:] = env.root_states[:, 3:7]
-    env.base_lin_vel[:] = quat_rotate_inverse(env.base_quat, env.root_states[:, 7:10])
-    env.base_ang_vel[:] = quat_rotate_inverse(env.base_quat, env.root_states[:, 10:13])
+    base_lin_vel, base_ang_vel = mujoco_free_joint_velocity_to_base(
+        env.base_quat, env.root_states[:, 7:13]
+    )
+    env.base_lin_vel[:] = base_lin_vel
+    env.base_ang_vel[:] = base_ang_vel
     env.projected_gravity[:] = quat_rotate_inverse(env.base_quat, env.gravity_vec)
     if env.cfg.terrain.measure_heights:
         env.measured_heights = env._get_heights()

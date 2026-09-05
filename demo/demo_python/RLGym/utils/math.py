@@ -1,4 +1,6 @@
 import math
+from typing import Tuple
+
 import torch
 
 
@@ -34,6 +36,18 @@ def quat_apply(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
 
 def quat_rotate_inverse(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     return quat_apply(quat_conjugate(q), v)
+
+
+def mujoco_free_joint_velocity_to_base(
+    q: torch.Tensor, qvel: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Convert a MuJoCo free-joint velocity to policy base velocities.
+
+    MuJoCo stores free-joint linear velocity in the world frame, while its
+    angular velocity is already expressed in the body's local frame.  Only
+    the linear component therefore needs to be inverse-rotated.
+    """
+    return quat_rotate_inverse(q, qvel[..., :3]), qvel[..., 3:6]
 
 
 def quat_apply_yaw(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:

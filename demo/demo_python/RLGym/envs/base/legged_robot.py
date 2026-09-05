@@ -14,7 +14,15 @@ from rsl_rl.env import VecEnv
 from RLGym import ROOT_DIR
 from RLGym.envs.base.legged_robot_config import LeggedRobotCfg
 from RLGym.utils.helpers import class_to_dict
-from RLGym.utils.math import quat_apply, quat_apply_yaw, quat_mul, quat_rotate_inverse, torch_rand_float, wrap_to_pi
+from RLGym.utils.math import (
+    mujoco_free_joint_velocity_to_base,
+    quat_apply,
+    quat_apply_yaw,
+    quat_mul,
+    quat_rotate_inverse,
+    torch_rand_float,
+    wrap_to_pi,
+)
 from RLGym.utils.terrain import TerrainLayout
 
 
@@ -68,8 +76,11 @@ class LeggedRobot(VecEnv):
         self._refresh_sim_tensors()
 
         self.base_quat[:] = self.root_states[:, 3:7]
-        self.base_lin_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
-        self.base_ang_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
+        base_lin_vel, base_ang_vel = mujoco_free_joint_velocity_to_base(
+            self.base_quat, self.root_states[:, 7:13]
+        )
+        self.base_lin_vel[:] = base_lin_vel
+        self.base_ang_vel[:] = base_ang_vel
         self.projected_gravity[:] = quat_rotate_inverse(self.base_quat, self.gravity_vec)
 
         self._post_physics_step_callback()
@@ -463,8 +474,10 @@ class LeggedRobot(VecEnv):
         self.last_feet_pos_world = torch.zeros(self.num_envs, len(self.feet_indices), 3, dtype=torch.float, device=self.device)
         self.episode_foot_contact_sums = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.float, device=self.device)
 
-        self.base_lin_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
-        self.base_ang_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
+        self.base_lin_vel, base_ang_vel = mujoco_free_joint_velocity_to_base(
+            self.base_quat, self.root_states[:, 7:13]
+        )
+        self.base_ang_vel = base_ang_vel.clone()
         self.projected_gravity = quat_rotate_inverse(self.base_quat, self.gravity_vec)
 
         if self.cfg.terrain.measure_heights:
