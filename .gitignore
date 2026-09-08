@@ -136,3 +136,10 @@ MUJOCO_LOG.txt
 # Local toolchains and dependency installs.
 /.deps/
 /.rust/
+
+# Frozen protocol, checkpoints, raw logs and figures for the parallelism matrix.
+/sire_parallel_experiment_20260906/
+/sire_parallel_experiment_20260907/
+
+# Local MuJoCo policy/joystick deployment sandbox (not versioned).
+/sim2sim/

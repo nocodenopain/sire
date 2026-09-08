@@ -42,6 +42,10 @@ def _parse_float_list(value):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--task', type=str, default='go2')
+    p.add_argument('--parallel_experiment_context', type=str, default=None,
+                   help='Optional frozen parallel-experiment attempt JSON; no rollout override.')
+    p.add_argument('--fixed_batch_experiment_context', type=str, default=None,
+                   help='Opt-in v2 experiment: frozen global batch and N-dependent rollout length.')
     p.add_argument('--num_envs', type=int, default=None)
     p.add_argument(
         '--sim_dt',
@@ -161,6 +165,17 @@ def _infer_scene_tag(env_cfg):
 
 def main():
     args = parse_args()
+    experiment = None
+    if args.parallel_experiment_context and args.fixed_batch_experiment_context:
+        raise ValueError('Choose only one experiment protocol')
+    if args.fixed_batch_experiment_context:
+        from SireRLGym.experiments.fixed_batch.measure import FixedBatchAttempt
+        experiment = FixedBatchAttempt(args.fixed_batch_experiment_context)
+        experiment.configure_threads()
+    elif args.parallel_experiment_context:
+        from SireRLGym.experiments.parallel.measure import ExperimentAttempt
+        experiment = ExperimentAttempt(args.parallel_experiment_context)
+        experiment.configure_threads()
     env_cfg = make_env_cfg(args.task)
     train_cfg = make_train_cfg(args.task)
 
@@ -271,6 +286,8 @@ def main():
     , flush=True)
 
     set_seed(train_cfg.seed)
+    if experiment is not None:
+        experiment.validate_config(args, env_cfg, train_cfg)
 
     env = make_env_from_cfg(args.task, env_cfg, headless=not args.head)
     scene_tag = _infer_scene_tag(env_cfg)
@@ -296,6 +313,8 @@ def main():
         train_cfg_dict['runner']['visualize_resource_path'] = args.visualize_resource_path
     train_cfg_dict['runner']['log_root'] = log_root
     runner = OnPolicyRunner(env, train_cfg_dict, log_dir=log_dir, device='cpu')
+    if experiment is not None:
+        experiment.attach(runner)
     if resume_path is not None:
         checkpoint = runner.load(resume_path)
         print(f"train_resume path={resume_path} iter={runner.current_learning_iteration} log_dir={log_dir}", flush=True)
@@ -310,10 +329,14 @@ def main():
     )
     try:
         runner.learn(remaining_iterations)
+        if experiment is not None:
+            experiment.complete()
     finally:
         # Persist the latest complete iteration even when native simulation or
         # PPO raises before training reaches its requested target.
         runner.close()
+        if experiment is not None:
+            experiment.close()
 
 
 if __name__ == '__main__':

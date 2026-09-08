@@ -108,6 +108,8 @@ from SireRLGym.utils.joint_order import JointOrderAdapter
 
 class OnPolicyRunner:
     def __init__(self, env, train_cfg, log_dir=None, device='cpu'):
+        # Optional, measurement-only experiment observer; ordinary training is unchanged.
+        self.experiment_observer = None
         self.cfg = train_cfg['runner']
         self.alg_cfg = train_cfg['algorithm']
         self.policy_cfg = train_cfg['policy']
@@ -240,6 +242,8 @@ class OnPolicyRunner:
             )
             iteration_episode_returns = []
 
+            if self.experiment_observer is not None:
+                self.experiment_observer.collection_start(it)
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
                     actions = self.alg.act(obs, critic_obs)
@@ -272,6 +276,8 @@ class OnPolicyRunner:
                         cur_reward_sum[new_ids] = 0
                         cur_episode_length[new_ids] = 0
 
+                if self.experiment_observer is not None:
+                    self.experiment_observer.collection_end()
                 stop = time.time()
                 collection_time = stop - start
                 start = stop
@@ -279,6 +285,8 @@ class OnPolicyRunner:
                 rollout_diagnostics = self._capture_rollout_diagnostics()
 
             update_out = self.alg.update()
+            if self.experiment_observer is not None:
+                self.experiment_observer.update_end()
             if isinstance(update_out, tuple):
                 mean_value_loss = update_out[0]
                 mean_surrogate_loss = update_out[1]
@@ -304,6 +312,11 @@ class OnPolicyRunner:
             stop = time.time()
             learn_time = stop - start
 
+            if self.experiment_observer is not None:
+                self.experiment_observer.iteration_end(
+                    it, rewbuffer, lenbuffer, physics_recoveries,
+                    rollout_diagnostics, mean_value_loss,
+                )
             if self.log_dir is not None:
                 self.log(locals())
             if it % self.save_interval == 0:
