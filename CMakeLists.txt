@@ -73,9 +73,10 @@ find_pkg_path(stduuid stduuid)
 
 find_pkg_path(msgpack-cxx msgpack_cxx)
 
-# Clarabel doesn't export a CMake config, so we include it directly from the source tree
+# Clarabel doesn't export a CMake config. Reuse its existing Rust runtime for
+# normal C++ iterations; the helper falls back to a source build when missing.
 if(NOT TARGET libclarabel_c_shared)
-	add_subdirectory(${CMAKE_SOURCE_DIR}/third_party/clarabel ${CMAKE_BINARY_DIR}/clarabel)
+	include(${CMAKE_SOURCE_DIR}/cmake_macros/clarabel_dependency.cmake)
 endif()
 
 include(GenerateExportHeader)
@@ -228,6 +229,10 @@ target_sources(sire_physics
 		"src/physics/contact/ps_vs_solver.cpp"
 		"src/physics/contact/ps_vs_solver2.cpp"
 		"src/physics/contact/ps_vs_solver3.cpp"
+		"src/physics/contact/ps_vs_solver_v5.cpp"
+		"src/physics/contact/simple_admm_contact_solver.cpp"
+		"src/physics/contact/newton_pipg_contact_solver.cpp"
+		"src/physics/contact/exact_coulomb_contact_solver.cpp"
 		"src/physics/collision/collision_detection.cpp"
 		"src/physics/collision/collision_filter.cpp"
 		"src/physics/collision/collision_exists_callback.cpp"
@@ -258,6 +263,10 @@ target_sources(sire_physics
 		"include/sire/physics/contact/ps_vs_solver.hpp"
 		"include/sire/physics/contact/ps_vs_solver2.hpp"
 		"include/sire/physics/contact/ps_vs_solver3.hpp"
+		"include/sire/physics/contact/ps_vs_solver_v5.hpp"
+		"include/sire/physics/contact/simple_admm_contact_solver.hpp"
+		"include/sire/physics/contact/newton_pipg_contact_solver.hpp"
+		"include/sire/physics/contact/exact_coulomb_contact_solver.hpp"
 		"include/sire/physics/contact/contact_solver_result.hpp"
 		"include/sire/physics/collision/collision_detection.hpp"
 		"include/sire/physics/collision/collision_filter.hpp"
@@ -511,7 +520,7 @@ target_link_libraries(sire_lib PUBLIC ${PUB_RELY_LINK_LIB} PRIVATE ${PRI_RELY_LI
 
 if(WIN32)
 	add_custom_command(TARGET sire_lib POST_BUILD
-		COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/third_party/clarabel/rust_wrapper/target/$<IF:$<CONFIG:Debug>,debug,release>/clarabel_c.dll $<TARGET_FILE_DIR:sire_lib>
+		COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_PROPERTY:libclarabel_c_shared,SIRE_RUNTIME_FILE> $<TARGET_FILE_DIR:sire_lib>
 	)
 endif()
 

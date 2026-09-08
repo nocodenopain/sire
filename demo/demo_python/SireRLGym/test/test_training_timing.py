@@ -16,17 +16,15 @@ def _cfg(dt=0.001, decimation=20):
 
 
 class TrainingTimingTest(unittest.TestCase):
-    def test_go2_fall_penalty_is_one_reward_unit_for_both_supported_steps(self):
+    def test_step_override_preserves_upstream_reward_scales(self):
         env_cfg = make_env_cfg("go2")
         control_dt = float(env_cfg.sim.dt) * int(env_cfg.control.decimation)
-        self.assertAlmostEqual(
-            float(env_cfg.rewards.scales.termination) * control_dt, -1.0
-        )
+        termination_reward = float(env_cfg.rewards.scales.termination) * control_dt
 
         _apply_sim_dt_override(env_cfg, 0.005)
         control_dt = float(env_cfg.sim.dt) * int(env_cfg.control.decimation)
         self.assertAlmostEqual(
-            float(env_cfg.rewards.scales.termination) * control_dt, -1.0
+            float(env_cfg.rewards.scales.termination) * control_dt, termination_reward
         )
 
     def test_five_millisecond_step_preserves_twenty_millisecond_control(self):

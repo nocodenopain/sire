@@ -77,7 +77,7 @@ def baseline_config(num_envs=128, threads=4, iterations=500):
     env.terrain.curriculum = False
     # Validate defaults rather than silently changing the baseline.
     assert not env.commands.curriculum
-    assert not env.sim.sire_diagnostics and env.sim.sire_recording_env_id == -1
+    assert not env.sim.sire_diagnostics
     assert env.control.decimation == 4
     assert train.algorithm.num_learning_epochs == 5
     assert train.algorithm.num_mini_batches == 4

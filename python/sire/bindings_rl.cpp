@@ -1,9 +1,9 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
-#include <cstdint>
 #include <exception>
 #include <functional>
 #include <iomanip>
@@ -24,16 +24,13 @@
 #include "sire/actuator/actuator.hpp"
 #include "sire/physics/physics_engine.hpp"
 #include "sire/simulator/simulator.hpp"
+#include "sire/core/profiler.hpp"
+#include "sire/simulator/event_manager.hpp"
 
 namespace py = pybind11;
 using namespace pybind11::literals;
 
 namespace {
-
-class PhysicsSafetyBoundsError final : public std::runtime_error {
- public:
-  using std::runtime_error::runtime_error;
-};
 
 class ParallelExecutor {
  public:
@@ -190,6 +187,7 @@ class SireRLBatchStepper {
         control_type_ != "T") {
       throw std::invalid_argument("control_type must be P, V, or T");
     }
+
     motion_indices_ = copyVector(motion_indices, "motion_indices");
     foot_part_ids_ = copyVector(foot_part_ids, "foot_part_ids");
     p_gains_ = copyVector(p_gains, "p_gains");
@@ -210,6 +208,18 @@ class SireRLBatchStepper {
     if (num_actions_ == 0) {
       throw std::invalid_argument("motion_indices must not be empty");
     }
+    for (std::size_t dof_id = 0; dof_id < num_actions_; ++dof_id) {
+      if (!std::isfinite(torque_limits_[dof_id]) ||
+          !(torque_limits_[dof_id] > 0.0)) {
+        throw std::invalid_argument("torque_limits must be finite and positive");
+      }
+      if (!std::isfinite(dof_lower_[dof_id]) ||
+          !std::isfinite(dof_upper_[dof_id]) ||
+          dof_lower_[dof_id] > dof_upper_[dof_id]) {
+        throw std::invalid_argument(
+            "dof_lower and dof_upper must be finite ordered bounds");
+      }
+    }
 
     simulators_.reserve(num_envs_);
     models_.reserve(num_envs_);
@@ -227,13 +237,20 @@ class SireRLBatchStepper {
           &simulator->simulationLoop());
       auto* engine = const_cast<sire::physics::PhysicsEngine*>(
           &simulator->physicsEngine());
+      if (loop->eventManager().getHandlerIdByEventId(0) != 12 ||
+          loop->eventManager().getHandlerIdByEventId(1) != 13 ||
+          loop->eventManager().getHandlerIdByEventId(2) != 14) {
+        throw std::invalid_argument(
+            "SireRLBatchStepper requires initial5/step5/ctrl5 handlers");
+      }
       if (env_id == 0) {
         num_bodies_ = model->partPool().size();
       } else if (model->partPool().size() != num_bodies_) {
         throw std::invalid_argument(
             "all Simulator models must have the same number of bodies");
       }
-      for (int motion_index : motion_indices_) {
+      for (std::size_t dof_id = 0; dof_id < num_actions_; ++dof_id) {
+        const int motion_index = motion_indices_[dof_id];
         if (motion_index < 0 ||
             static_cast<std::size_t>(motion_index) >= model->motionPool().size()) {
           throw std::out_of_range("motion index is outside the model motionPool");
@@ -244,15 +261,22 @@ class SireRLBatchStepper {
           throw std::invalid_argument(
               "every selected motion must be an ActuatorSISO");
         }
+        // The actuator is the single source of truth for physical effort and
+        // joint ranges. It applies these guards before every dynamics solve.
+        actuator->setMinForce(-torque_limits_[dof_id]);
+        actuator->setMaxForce(torque_limits_[dof_id]);
+        actuator->setMinPosition(dof_lower_[dof_id]);
+        actuator->setMaxPosition(dof_upper_[dof_id]);
       }
       for (int part_id : foot_part_ids_) {
         if (part_id < 0 || static_cast<std::size_t>(part_id) >= num_bodies_) {
           throw std::out_of_range("foot part id is outside the model partPool");
         }
       }
-      // RL state only needs the lightweight latest-contact cache. Replay
-      // history is opt-in through setRecordingEnv(), keeping the established
-      // constructor signature compatible with existing Python callers.
+      if (std::find(simulators_.begin(), simulators_.end(), simulator) !=
+          simulators_.end()) {
+        throw std::invalid_argument("each environment must own a distinct Simulator");
+      }
       loop->recorder().setHistoryEnabled(false);
       simulators_.push_back(simulator);
       models_.push_back(model);
@@ -262,7 +286,17 @@ class SireRLBatchStepper {
 
     previous_dof_vel_.assign(num_envs_ * num_actions_, 0.0);
     errors_.resize(num_envs_);
-    recoverable_errors_.resize(num_envs_);
+    recovered_errors_.resize(num_envs_);
+    pre_step_snapshots_.resize(num_envs_);
+    snapshot_scratch_.resize(num_envs_);
+    for (std::size_t env_id = 0; env_id < num_envs_; ++env_id) {
+      for (auto* snapshot : {&pre_step_snapshots_[env_id],
+                             &snapshot_scratch_[env_id]}) {
+        snapshot->mp.resize(num_actions_);
+        snapshot->mv.resize(num_actions_);
+        snapshot->torque.resize(num_actions_);
+      }
+    }
     allocateOutputs();
   }
 
@@ -282,52 +316,55 @@ class SireRLBatchStepper {
       throw std::invalid_argument(message.str());
     }
     const auto* action_data = static_cast<const float*>(info.ptr);
+    // Invalid policy output is a global training error. Validate it before any
+    // environment advances so a retry cannot double-step healthy environments.
+    for (std::size_t i = 0; i < num_envs_ * num_actions_; ++i) {
+      if (!std::isfinite(action_data[i])) {
+        const std::size_t env_id = i / num_actions_;
+        const std::size_t dof_id = i % num_actions_;
+        std::ostringstream reason;
+        reason << "action contains NaN or Inf at dof_id=" << dof_id;
+        throw std::runtime_error(formatError(
+            env_id, reason.str(), action_data + env_id * num_actions_));
+      }
+    }
     std::fill(errors_.begin(), errors_.end(), std::string{});
-    std::fill(recoverable_errors_.begin(), recoverable_errors_.end(),
-              std::string{});
+    std::fill(recovered_errors_.begin(), recovered_errors_.end(), std::string{});
 
     {
       py::gil_scoped_release release;
       executor_.run(num_envs_, [this, action_data](std::size_t env_id) {
         try {
           stepOne(env_id, action_data + env_id * num_actions_);
-        } catch (const PhysicsSafetyBoundsError& error) {
-          // A single independently simulated RL environment can occasionally
-          // diverge after a pathological contact. Preserve its previous
-          // finite output row so Python can terminate and reset only that
-          // episode. All other exception classes remain fail-fast below.
-          recoverable_errors_[env_id] = formatError(
-              env_id, error.what(), action_data + env_id * num_actions_);
         } catch (const std::exception& error) {
-          errors_[env_id] = formatError(env_id, error.what(),
-                                        action_data + env_id * num_actions_);
+          const std::string failure = formatError(
+              env_id, error.what(), action_data + env_id * num_actions_);
+          try {
+            recoverEnvironment(env_id);
+            recovered_errors_[env_id] = failure;
+          } catch (const std::exception& recovery_error) {
+            errors_[env_id] = failure + " recovery_failed=" +
+                              std::string(recovery_error.what());
+          } catch (...) {
+            errors_[env_id] = failure + " recovery_failed=unknown exception";
+          }
         } catch (...) {
-          errors_[env_id] = formatError(env_id, "unknown C++ exception",
-                                        action_data + env_id * num_actions_);
+          const std::string failure = formatError(
+              env_id, "unknown C++ exception",
+              action_data + env_id * num_actions_);
+          try {
+            recoverEnvironment(env_id);
+            recovered_errors_[env_id] = failure;
+          } catch (...) {
+            errors_[env_id] = failure + " recovery_failed=unknown exception";
+          }
         }
       });
     }
 
     throwErrors("step");
+    total_recovered_failures_ += recoveredEnvIds().size();
     return outputs();
-  }
-
-  auto recoverableEnvIds() const -> std::vector<std::int64_t> {
-    std::vector<std::int64_t> ids;
-    for (std::size_t env_id = 0; env_id < recoverable_errors_.size(); ++env_id) {
-      if (!recoverable_errors_[env_id].empty()) {
-        ids.push_back(static_cast<std::int64_t>(env_id));
-      }
-    }
-    return ids;
-  }
-
-  auto recoverableErrors() const -> std::vector<std::string> {
-    std::vector<std::string> result;
-    for (const auto& error : recoverable_errors_) {
-      if (!error.empty()) result.push_back(error);
-    }
-    return result;
   }
 
   auto reset(py::array env_ids) -> void {
@@ -346,6 +383,8 @@ class SireRLBatchStepper {
       ids[i] = static_cast<std::size_t>(id_data[i]);
       errors_[ids[i]].clear();
     }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
 
     {
       py::gil_scoped_release release;
@@ -366,6 +405,14 @@ class SireRLBatchStepper {
     throwErrors("reset");
   }
 
+  // Call between batch steps, with the GIL held. Only env 0 is recorded.
+  auto setHistoryRecording(bool enabled) -> void {
+    auto* loop = loops_.front();
+    if (loop->recorder().historyEnabled() == enabled) return;
+    loop->recorder().setHistoryEnabled(enabled);
+    loop->recorder().addRecord(loop->simTime());
+  }
+
   auto resetRecorders() -> void {
     std::fill(errors_.begin(), errors_.end(), std::string{});
     {
@@ -384,20 +431,6 @@ class SireRLBatchStepper {
     throwErrors("resetRecorders");
   }
 
-  auto setRecordingEnv(std::int64_t recording_env_id) -> void {
-    validateRecordingEnvId(recording_env_id);
-    for (std::size_t env_id = 0; env_id < num_envs_; ++env_id) {
-      loops_[env_id]->recorder().setHistoryEnabled(
-          recording_env_id >= 0 &&
-          env_id == static_cast<std::size_t>(recording_env_id));
-    }
-    recording_env_id_ = recording_env_id;
-  }
-
-  auto recordingEnv() const noexcept -> std::int64_t {
-    return recording_env_id_;
-  }
-
   auto outputs() const -> py::tuple {
     return py::make_tuple(root_states_, dof_pos_, dof_vel_, torques_,
                           contact_forces_, feet_pos_, body_ground_contact_,
@@ -414,17 +447,34 @@ class SireRLBatchStepper {
     return executor_.dispatchCount();
   }
   auto numEnvs() const noexcept -> std::size_t { return num_envs_; }
-
- private:
-  auto validateRecordingEnvId(std::int64_t recording_env_id) const -> void {
-    if (recording_env_id < -1 ||
-        (recording_env_id >= 0 &&
-         static_cast<std::size_t>(recording_env_id) >= num_envs_)) {
-      throw std::out_of_range(
-          "recording_env_id must be -1 or a valid environment id");
+  auto recoveredEnvIds() const -> std::vector<std::size_t> {
+    std::vector<std::size_t> ids;
+    for (std::size_t i = 0; i < recovered_errors_.size(); ++i) {
+      if (!recovered_errors_[i].empty()) ids.push_back(i);
     }
+    return ids;
+  }
+  auto recoveredErrors() const -> std::vector<std::string> {
+    std::vector<std::string> result;
+    for (const auto& error : recovered_errors_) {
+      if (!error.empty()) result.push_back(error);
+    }
+    return result;
+  }
+  auto totalRecoveredFailures() const noexcept -> std::size_t {
+    return total_recovered_failures_;
   }
 
+ private:
+  struct StepSnapshot {
+    bool valid{false};
+    double sim_time{0.0};
+    std::array<double, 7> pq{};
+    std::array<double, 6> vs{};
+    std::vector<double> mp;
+    std::vector<double> mv;
+    std::vector<double> torque;
+  };
   template <typename T>
   static auto copyVector(
       const py::array_t<T, py::array::c_style | py::array::forcecast>& array,
@@ -501,13 +551,10 @@ class SireRLBatchStepper {
             previous_dof_vel_[env_id * num_actions_ + dof_id];
         torque = p_gains_[dof_id] * (scaled_action - motion.mv()) -
                  d_gains_[dof_id] *
-                     (motion.mv() - previous_velocity) /
-                     std::max(control_dt_, 1e-6);
+                     (motion.mv() - previous_velocity) / control_dt_;
       } else {
         torque = scaled_action;
       }
-      torque = std::clamp(torque, -torque_limits_[dof_id],
-                          torque_limits_[dof_id]);
       auto* actuator =
           dynamic_cast<sire::actuator::ActuatorSISO*>(&motion);
       if (actuator == nullptr) {
@@ -515,37 +562,89 @@ class SireRLBatchStepper {
       }
       actuator->setDesiredValue(torque);
       torques_data_[env_id * num_actions_ + dof_id] =
-          static_cast<float>(torque);
+          static_cast<float>(actuator->limitedDesiredValue());
     }
   }
 
   auto stepOne(std::size_t env_id, const float* actions) -> void {
     auto* loop = loops_[env_id];
-    double last_dt = 0.0;
-    // Validate the state before it can enter contact handling as well as after
-    // every sub-step.  This is an RL adapter guard only: normal integration
-    // and contact solving are unchanged.
-    ensurePhysicsStateWithinSafetyBounds(env_id);
-    clampJointStateToLimits(env_id);
-    while (!loop->headerIsCtrl()) {
+    const double start_time = loop->simTime();
+    std::size_t event_count = 0;
+    // One control-boundary snapshot is sufficient to diagnose and recover a
+    // failed rollout. Taking it for every 1 kHz event adds avoidable overhead
+    // to all healthy environments; the integrator itself guards every event.
+    capturePreStepSnapshot(env_id);
+    // Handler5 integrates forward from the current event. Leave the next
+    // control event pending so the next action owns that control interval.
+    do {
+      if (++event_count > 100000) {
+        throw std::runtime_error("control interval exceeded 100000 events");
+      }
       updateActuatorTorque(env_id, actions);
-      const double before = loop->simTime();
       loop->handleContact();
-      last_dt = loop->simTime() - before;
-      // Contact integration can diverge within a sub-step. Check immediately
-      // so the next sub-step never feeds an already exploded pose into coal's
-      // broadphase tree before the per-environment recovery path can run.
-      ensurePhysicsStateWithinSafetyBounds(env_id);
-      clampJointStateToLimits(env_id);
-    }
-    updateActuatorTorque(env_id, actions);
-    const double before = loop->simTime();
-    loop->handleContact();
-    last_dt = loop->simTime() - before;
-    ensurePhysicsStateWithinSafetyBounds(env_id);
-    clampJointStateToLimits(env_id);
-    dt_actual_data_[env_id] = last_dt;
+    } while (!loop->headerIsCtrl());
+    dt_actual_data_[env_id] = loop->simTime() - start_time;
     readState(env_id);
+
+  }
+
+  auto capturePreStepSnapshot(std::size_t env_id) -> void {
+    auto& snapshot = snapshot_scratch_[env_id];
+    auto* model = models_[env_id];
+    snapshot.sim_time = loops_[env_id]->simTime();
+    model->partPool().at(1).getPq(snapshot.pq.data());
+    model->partPool().at(1).getVs(snapshot.vs.data());
+    auto& motion_pool = model->motionPool();
+    for (std::size_t dof_id = 0; dof_id < num_actions_; ++dof_id) {
+      auto& motion = motion_pool.at(
+          static_cast<std::size_t>(motion_indices_[dof_id]));
+      snapshot.mp[dof_id] = motion.mp();
+      snapshot.mv[dof_id] = motion.mv();
+      auto* actuator = dynamic_cast<sire::actuator::ActuatorSISO*>(&motion);
+      snapshot.torque[dof_id] =
+          actuator == nullptr ? 0.0 : actuator->appliedValue();
+    }
+    // Catch an already-diverging state before another contact solve/integration
+    // turns it into Inf or NaN. These are numerical-failure bounds, not model
+    // limits and are deliberately much wider than normal GO2 motion.
+    for (double value : snapshot.pq) {
+      if (!std::isfinite(value))
+        throw std::runtime_error("pre-step base pose contains NaN or Inf");
+    }
+    for (double value : snapshot.vs) {
+      if (!std::isfinite(value) || std::abs(value) > 1e4)
+        throw std::runtime_error("pre-step base twist exceeded safety bound");
+    }
+    for (std::size_t i = 0; i < num_actions_; ++i) {
+      if (!std::isfinite(snapshot.mp[i]) || !std::isfinite(snapshot.mv[i]) ||
+          std::abs(snapshot.mv[i]) > 1e4) {
+        throw std::runtime_error("pre-step joint state exceeded safety bound");
+      }
+    }
+    snapshot.valid = true;
+    std::swap(pre_step_snapshots_[env_id], snapshot_scratch_[env_id]);
+  }
+
+  auto recoverEnvironment(std::size_t env_id) -> void {
+    simulators_[env_id]->simReset();
+    std::fill_n(previous_dof_vel_.data() + env_id * num_actions_,
+                num_actions_, 0.0);
+
+    float* root = root_states_data_ + env_id * 13;
+    std::fill_n(root, std::size_t(13), 0.0F);
+    root[6] = 1.0F;
+    std::fill_n(dof_pos_data_ + env_id * num_actions_, num_actions_, 0.0F);
+    std::fill_n(dof_vel_data_ + env_id * num_actions_, num_actions_, 0.0F);
+    std::fill_n(torques_data_ + env_id * num_actions_, num_actions_, 0.0F);
+    std::fill_n(contact_forces_data_ + env_id * num_bodies_ * std::size_t(3),
+                num_bodies_ * std::size_t(3), 0.0F);
+    std::fill_n(body_ground_contact_data_ + env_id * num_bodies_, num_bodies_,
+                false);
+    std::fill_n(foot_ground_contact_data_ + env_id * num_feet_, num_feet_,
+                false);
+    std::fill_n(feet_pos_data_ + env_id * num_feet_ * std::size_t(3),
+                num_feet_ * std::size_t(3), 0.0F);
+    dt_actual_data_[env_id] = 0.0;
   }
 
   auto resetRecorderForContinuation(std::size_t env_id) -> void {
@@ -559,6 +658,7 @@ class SireRLBatchStepper {
 
   auto readState(std::size_t env_id) -> void {
     auto* model = models_[env_id];
+    engines_[env_id]->enforceJointLimitSafety();
     auto& base = model->partPool().at(1);
     double pq[7]{0.0};
     double vs[6]{0.0};
@@ -567,7 +667,21 @@ class SireRLBatchStepper {
     base.getVs(vs);
     aris::dynamic::s_vs2vp(vs, pq, vp);
 
-    validatePhysicsState(pq, vs, vp);
+    if (std::abs(pq[0]) > 100.0 || std::abs(pq[1]) > 100.0 ||
+        pq[2] < -5.0 || pq[2] > 50.0 || std::abs(vp[0]) > 100.0 ||
+        std::abs(vp[1]) > 100.0 || std::abs(vp[2]) > 100.0 ||
+        std::abs(vs[3]) > 100.0 || std::abs(vs[4]) > 100.0 ||
+        std::abs(vs[5]) > 100.0) {
+      throw std::runtime_error("physics state exceeded configured safety bounds");
+    }
+    for (double value : pq) {
+      if (!std::isfinite(value))
+        throw std::runtime_error("base pose contains NaN or Inf");
+    }
+    for (double value : vs) {
+      if (!std::isfinite(value))
+        throw std::runtime_error("base velocity contains NaN or Inf");
+    }
 
     float* root = root_states_data_ + env_id * 13;
     for (std::size_t i = 0; i < 7; ++i) root[i] = static_cast<float>(pq[i]);
@@ -579,29 +693,19 @@ class SireRLBatchStepper {
     for (std::size_t dof_id = 0; dof_id < num_actions_; ++dof_id) {
       auto& motion = motion_pool.at(
           static_cast<std::size_t>(motion_indices_[dof_id]));
+      auto* actuator = dynamic_cast<sire::actuator::ActuatorSISO*>(&motion);
+      if (actuator == nullptr) {
+        throw std::runtime_error("selected motion is no longer an ActuatorSISO");
+      }
       double position = motion.mp();
       double velocity = motion.mv();
       if (!std::isfinite(position) || !std::isfinite(velocity)) {
         throw std::runtime_error("joint state contains NaN or Inf");
       }
-      if (position < dof_lower_[dof_id]) {
-        position = dof_lower_[dof_id];
-        motion.setMp(position);
-        if (velocity < 0.0) {
-          velocity = 0.0;
-          motion.setMv(velocity);
-        }
-      } else if (position > dof_upper_[dof_id]) {
-        position = dof_upper_[dof_id];
-        motion.setMp(position);
-        if (velocity > 0.0) {
-          velocity = 0.0;
-          motion.setMv(velocity);
-        }
-      }
       const std::size_t offset = env_id * num_actions_ + dof_id;
       dof_pos_data_[offset] = static_cast<float>(position);
       dof_vel_data_[offset] = static_cast<float>(velocity);
+      torques_data_[offset] = static_cast<float>(actuator->appliedValue());
       previous_dof_vel_[offset] = velocity;
     }
 
@@ -628,8 +732,8 @@ class SireRLBatchStepper {
     const auto& latest_contact_results =
         loops_[env_id]->recorder().latestContactPairResults();
     {
-      const double scale =
-          simulation_dt_ > 0.0 ? dt_actual_data_[env_id] / simulation_dt_ : 1.0;
+      // Latest physical-substep forces in N, not an impulse or an average
+      // over the control interval. Do not scale by either timestep.
       for (const auto& result : latest_contact_results) {
         const auto* geom_a =
             engines_[env_id]->queryGeometryPoolById(result.geomIdA);
@@ -644,7 +748,7 @@ class SireRLBatchStepper {
         }
         for (std::size_t axis = 0; axis < 3; ++axis) {
           const float force =
-              static_cast<float>(result.force_W[axis] * scale);
+              static_cast<float>(result.force_W[axis]);
           contact[part_a * 3 + axis] -= force;
           contact[part_b * 3 + axis] += force;
         }
@@ -655,79 +759,6 @@ class SireRLBatchStepper {
     for (std::size_t foot_id = 0; foot_id < num_feet_; ++foot_id) {
       foot_contact[foot_id] =
           body_contact[static_cast<std::size_t>(foot_part_ids_[foot_id])];
-    }
-  }
-
-  auto clampJointStateToLimits(std::size_t env_id) const -> void {
-    auto& motion_pool = models_[env_id]->motionPool();
-    for (std::size_t dof_id = 0; dof_id < num_actions_; ++dof_id) {
-      auto& motion = motion_pool.at(
-          static_cast<std::size_t>(motion_indices_[dof_id]));
-      double position = motion.mp();
-      double velocity = motion.mv();
-      if (position < dof_lower_[dof_id]) {
-        motion.setMp(dof_lower_[dof_id]);
-        if (velocity < 0.0) motion.setMv(0.0);
-      } else if (position > dof_upper_[dof_id]) {
-        motion.setMp(dof_upper_[dof_id]);
-        if (velocity > 0.0) motion.setMv(0.0);
-      }
-    }
-  }
-
-  auto ensurePhysicsStateWithinSafetyBounds(std::size_t env_id) const -> void {
-    auto* model = models_[env_id];
-    auto& base = model->partPool().at(1);
-    double pq[7]{0.0};
-    double vs[6]{0.0};
-    double vp[3]{0.0};
-    base.getPq(pq);
-    base.getVs(vs);
-    aris::dynamic::s_vs2vp(vs, pq, vp);
-    validatePhysicsState(pq, vs, vp);
-
-    // The Python environment already treats 100 rad/s as the Go2 joint
-    // velocity limit.  A one-radian margin beyond each mechanical position
-    // limit avoids changing the existing small-overshoot clamp in readState,
-    // while still catching a numerically exploded articulated state before it
-    // reaches another broadphase/contact solve or the RL reward buffers.
-    constexpr double kJointVelocitySafetyLimit = 100.0;
-    constexpr double kJointPositionSafetyMargin = 1.0;
-    auto& motion_pool = model->motionPool();
-    for (std::size_t dof_id = 0; dof_id < num_actions_; ++dof_id) {
-      const auto& motion = motion_pool.at(
-          static_cast<std::size_t>(motion_indices_[dof_id]));
-      const double position = motion.mp();
-      const double velocity = motion.mv();
-      if (!std::isfinite(position) || !std::isfinite(velocity)) {
-        throw std::runtime_error("joint state contains NaN or Inf");
-      }
-      if (std::abs(velocity) > kJointVelocitySafetyLimit ||
-          position < dof_lower_[dof_id] - kJointPositionSafetyMargin ||
-          position > dof_upper_[dof_id] + kJointPositionSafetyMargin) {
-        throw PhysicsSafetyBoundsError(
-            "joint state exceeded configured safety bounds");
-      }
-    }
-  }
-
-  static auto validatePhysicsState(const double* pq, const double* vs,
-                                   const double* vp) -> void {
-    if (std::abs(pq[0]) > 100.0 || std::abs(pq[1]) > 100.0 ||
-        pq[2] < -5.0 || pq[2] > 50.0 || std::abs(vp[0]) > 100.0 ||
-        std::abs(vp[1]) > 100.0 || std::abs(vp[2]) > 100.0 ||
-        std::abs(vs[3]) > 100.0 || std::abs(vs[4]) > 100.0 ||
-        std::abs(vs[5]) > 100.0) {
-      throw PhysicsSafetyBoundsError(
-          "physics state exceeded configured safety bounds");
-    }
-    for (std::size_t i = 0; i < 7; ++i) {
-      if (!std::isfinite(pq[i]))
-        throw std::runtime_error("base pose contains NaN or Inf");
-    }
-    for (std::size_t i = 0; i < 6; ++i) {
-      if (!std::isfinite(vs[i]))
-        throw std::runtime_error("base velocity contains NaN or Inf");
     }
   }
 
@@ -762,6 +793,25 @@ class SireRLBatchStepper {
         message << (i == 0 ? "" : ",") << motion.mv();
       }
       message << "]";
+      const auto& engine = *engines_.at(env_id);
+      message << " joint_limit={active="
+              << engine.jointLimitLastActiveCount()
+              << ",iterations=" << engine.jointLimitLastIterations()
+              << ",residual=" << engine.jointLimitLastResidual()
+              << ",max_reaction=" << engine.jointLimitLastMaxReaction()
+              << ",saturated=" << engine.jointLimitLastSaturatedCount()
+              << "}";
+      const auto& contacts = loop->recorder().latestContactPairResults();
+      double max_contact_force = 0.0;
+      for (const auto& contact : contacts) {
+        const double norm = std::sqrt(
+            contact.force_W[0] * contact.force_W[0] +
+            contact.force_W[1] * contact.force_W[1] +
+            contact.force_W[2] * contact.force_W[2]);
+        max_contact_force = std::max(max_contact_force, norm);
+      }
+      message << " contacts={count=" << contacts.size()
+              << ",max_force=" << max_contact_force << "}";
     } catch (const std::exception& snapshot_error) {
       message << " state_snapshot_error=" << snapshot_error.what();
     } catch (...) {
@@ -772,6 +822,25 @@ class SireRLBatchStepper {
       for (std::size_t i = 0; i < num_actions_; ++i)
         message << (i == 0 ? "" : ",") << actions[i];
       message << "]";
+    }
+    const auto& previous = pre_step_snapshots_.at(env_id);
+    if (previous.valid) {
+      message << " previous={sim_time=" << previous.sim_time << ",pq=[";
+      for (std::size_t i = 0; i < previous.pq.size(); ++i)
+        message << (i == 0 ? "" : ",") << previous.pq[i];
+      message << "],vs=[";
+      for (std::size_t i = 0; i < previous.vs.size(); ++i)
+        message << (i == 0 ? "" : ",") << previous.vs[i];
+      message << "],mp=[";
+      for (std::size_t i = 0; i < previous.mp.size(); ++i)
+        message << (i == 0 ? "" : ",") << previous.mp[i];
+      message << "],mv=[";
+      for (std::size_t i = 0; i < previous.mv.size(); ++i)
+        message << (i == 0 ? "" : ",") << previous.mv[i];
+      message << "],torque=[";
+      for (std::size_t i = 0; i < previous.torque.size(); ++i)
+        message << (i == 0 ? "" : ",") << previous.torque[i];
+      message << "]}";
     }
     return message.str();
   }
@@ -814,7 +883,10 @@ class SireRLBatchStepper {
   std::vector<double> dof_upper_;
   std::vector<double> previous_dof_vel_;
   std::vector<std::string> errors_;
-  std::vector<std::string> recoverable_errors_;
+  std::vector<std::string> recovered_errors_;
+  std::vector<StepSnapshot> pre_step_snapshots_;
+  std::vector<StepSnapshot> snapshot_scratch_;
+  std::size_t total_recovered_failures_{0};
   ParallelExecutor executor_;
 
   py::array_t<float> root_states_;
@@ -835,12 +907,16 @@ class SireRLBatchStepper {
   bool* body_ground_contact_data_{nullptr};
   bool* foot_ground_contact_data_{nullptr};
   double* dt_actual_data_{nullptr};
-  std::int64_t recording_env_id_{-1};
 };
 
 }  // namespace
 
 void init_rl(py::module& m) {
+#if defined(SIRE_PROFILE_TRACY)
+  m.attr("tracyEnabled") = true;
+#else
+  m.attr("tracyEnabled") = false;
+#endif
   py::class_<SireRLBatchStepper>(m, "SireRLBatchStepper")
       .def(py::init<
                py::sequence,
@@ -867,16 +943,19 @@ void init_rl(py::module& m) {
            "control_dt"_a,
            "sire_batch_threads"_a = 0)
       .def("step", &SireRLBatchStepper::step, "actions"_a)
-      .def("recoverableEnvIds", &SireRLBatchStepper::recoverableEnvIds)
-      .def("recoverableErrors", &SireRLBatchStepper::recoverableErrors)
       .def("reset", &SireRLBatchStepper::reset, "env_ids"_a)
       .def("resetRecorders", &SireRLBatchStepper::resetRecorders)
-      .def("setRecordingEnv", &SireRLBatchStepper::setRecordingEnv,
-           "recording_env_id"_a)
+      .def("setHistoryRecording", &SireRLBatchStepper::setHistoryRecording,
+           "enabled"_a)
       .def("outputs", &SireRLBatchStepper::outputs)
       .def_property_readonly("threadCount", &SireRLBatchStepper::threadCount)
       .def_property_readonly("workerCount", &SireRLBatchStepper::workerCount)
       .def_property_readonly("dispatchCount", &SireRLBatchStepper::dispatchCount)
       .def_property_readonly("numEnvs", &SireRLBatchStepper::numEnvs)
-      .def_property_readonly("recordingEnv", &SireRLBatchStepper::recordingEnv);
+      .def_property_readonly("recoveredEnvIds",
+                             &SireRLBatchStepper::recoveredEnvIds)
+      .def_property_readonly("recoveredErrors",
+                             &SireRLBatchStepper::recoveredErrors)
+      .def_property_readonly("totalRecoveredFailures",
+                             &SireRLBatchStepper::totalRecoveredFailures);
 }

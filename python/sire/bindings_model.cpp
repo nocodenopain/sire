@@ -1,5 +1,7 @@
 // Auto-split from sire_bindings.cpp
+#include <array>
 #include <codecvt>
+#include <cmath>
 #include <fstream>
 #include <iostream>
 #include <locale>
@@ -31,7 +33,6 @@
 #include "sire/physics/collision/collision_detection.hpp"
 #include "sire/physics/collision/collision_filter.hpp"
 #include "sire/physics/contact/analytical_implicit_friction_solver.hpp"
-#include "sire/physics/contact/analytical_tangent_force_solver.hpp"
 #include "sire/physics/contact/contact_position_force_solver.hpp"
 #include "sire/physics/contact/ps_vs_solver.hpp"
 #include "sire/physics/contact/ps_vs_solver2.hpp"
@@ -584,6 +585,21 @@ void init_model(py::module& m) {
             }
             self.setPq(pq.data());
           })
+      .def_property(
+          "prtIv",
+          [](const aris::dynamic::Part& self) {
+            const auto& iv = self.prtIv();
+            return std::vector<double>(iv, iv + 10);
+          },
+          [](aris::dynamic::Part& self, const std::vector<double>& iv) {
+            if (iv.size() != 10) {
+              throw std::runtime_error("Input array 'prtIv' size must be 10!");
+            }
+            if (!std::isfinite(iv[0]) || iv[0] <= 0.0) {
+              throw std::runtime_error("Part mass prtIv[0] must be finite and positive!");
+            }
+            self.setPrtIv(iv.data());
+          })
       .def("getAs",
            [](const aris::dynamic::Part& self) {
              std::vector<double> as(6, 0);
@@ -784,7 +800,45 @@ void init_model(py::module& m) {
       .def("getPm",
            [](sire::geometry::GeometryBase& self) -> std::vector<double> {
              return std::vector<double>(*self.pm(), *self.pm() + 16);
-           });
+           })
+      .def(
+          "cptInertial",
+          [](sire::geometry::GeometryBase& self, aris::dynamic::Part& part,
+             double mass) {
+            if (mass <= 0.0) {
+              throw std::runtime_error("Geometry mass must be positive!");
+            }
+
+            auto* geometry_on_part =
+                dynamic_cast<sire::geometry::GeometryOnPart*>(&self);
+            if (geometry_on_part == nullptr) {
+              throw std::runtime_error(
+                  "Inertia can only be assigned from a geometry on a part!");
+            }
+            if (geometry_on_part->partId() != part.id()) {
+              throw std::runtime_error(
+                  "Geometry and target part have different part ids!");
+            }
+
+            auto* shape = self.shape();
+            if (shape == nullptr) {
+              throw std::runtime_error(
+                  "This geometry does not expose a shape for inertia "
+                  "calculation!");
+            }
+
+            sire::geometry::ShapeToInertia calculator;
+            std::array<double, 10> geometry_iv{};
+            std::array<double, 10> part_iv{};
+            geometry_iv[0] = mass;
+            shape->Reify(&calculator, geometry_iv.data());
+            aris::dynamic::s_iv2iv(*self.pm(), geometry_iv.data(),
+                                   part_iv.data());
+            part.setPrtIv(part_iv.data());
+          },
+          py::arg("part"), py::arg("mass"),
+          "Compute this geometry's inertia, express it in the part frame, "
+          "and assign it to the target part.");
 
   py::class_<sire::geometry::GeometryOnPart, sire::geometry::GeometryBase>(
       m, "GeometryOnPart")

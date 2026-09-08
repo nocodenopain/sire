@@ -78,13 +78,20 @@ def main():
                 model.forwardKinematics()
                 model.forwardKinematicsVel()
 
-        def _resample_commands(self, env_ids):
+        def _resample_commands(self, env_ids, initialize=False):
             for eid in env_ids.tolist():
                 # Reset calls occur before episode_length is cleared by the base class.
                 step = int(self.episode_length_buf[eid]) if getattr(self, '_in_callback', False) else 0
                 command = max((c for c in trials[eid]['commands'] if c['control_step'] <= step),
                               key=lambda c: c['control_step'])
-                self.commands[eid] = torch.tensor([command['vx'], command['vy'], 0., command['heading']])
+                self.command_targets[eid] = torch.tensor(
+                    [command['vx'], command['vy'], 0., command['heading']],
+                    dtype=self.commands.dtype, device=self.device,
+                )
+            if initialize:
+                self.commands[env_ids, :3] = self._desired_velocity_commands(env_ids)
+                if self.cfg.commands.heading_command:
+                    self.commands[env_ids, 3] = self.command_targets[env_ids, 3]
 
         def _post_physics_step_callback(self):
             self._in_callback = True
@@ -101,7 +108,7 @@ def main():
             self.linear_error = torch.linalg.vector_norm(self.base_lin_vel[:, :2] - self.commands[:, :2], dim=1).clone()
             self.yaw_error = (self.base_ang_vel[:, 2] - self.commands[:, 2]).abs().clone()
             self.terminal_reasons = {}
-            failed = set(self._sire_batch_stepper.recoverableEnvIds())
+            failed = set(self._sire_batch_stepper.recoveredEnvIds)
             oob = self._terrain_out_of_bounds()
             contacts = (torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1).any(dim=1)
             for eid in self.reset_buf.nonzero(as_tuple=False).flatten().tolist():

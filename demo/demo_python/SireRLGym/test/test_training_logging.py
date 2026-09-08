@@ -4,10 +4,11 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
-from SireRLGym.runners.on_policy_runner import PersistentSummaryWriter
+from SireRLGym.runners.on_policy_runner import OnPolicyRunner, PersistentSummaryWriter
 
 
 class _FakeTensorBoardWriter:
@@ -28,6 +29,15 @@ class _FakeTensorBoardWriter:
 
 
 class TrainingLoggingTest(unittest.TestCase):
+    def test_recovery_diagnostics_use_upstream_native_counter(self):
+        runner = OnPolicyRunner.__new__(OnPolicyRunner)
+        runner.env = SimpleNamespace(
+            _sire_batch_stepper=SimpleNamespace(totalRecoveredFailures=7),
+        )
+        self.assertEqual(runner._physics_recovery_total(), 7)
+        runner.env._sire_batch_stepper.totalRecoveredFailures = 9
+        self.assertEqual(runner._physics_recovery_total(), 9)
+
     def test_jsonl_is_written_when_tensorboard_is_unavailable(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             writer = PersistentSummaryWriter(

@@ -1,5 +1,6 @@
 #include "sire/simulator/simulation_loop.hpp"
 
+#include <algorithm>
 #include <typeinfo>
 
 #include <aris/core/object.hpp>
@@ -23,6 +24,12 @@
 #include "log/easyloggingConfig.hpp"
 
 namespace sire::simulator {
+namespace {
+auto coincidentEventTolerance(double simulation_dt, double control_dt)
+    -> double {
+  return std::min(1e-6, 1e-3 * std::min(simulation_dt, control_dt));
+}
+}  // namespace
 auto ModelData::initFromModel(const aris::dynamic::Model& model) -> void {
   partSize = model.partPool().size();
   motionSize = model.motionPool().size();
@@ -483,7 +490,9 @@ auto SimulationLoop::cptNextCtrlSimSuggestDt() -> double {
   DLOG(DEBUG) << "next ctrl time " << nextCtrlTime << " next sim time "
               << nextSimTime;
   if (nextCtrlTime < nextSimTime ||
-      aris::dynamic::s_is_equal(nextCtrlTime, nextSimTime, 1e-6)) {
+      aris::dynamic::s_is_equal(
+          nextCtrlTime, nextSimTime,
+          coincidentEventTolerance(imp_->dt_, imp_->ctrlt_))) {
     nextCtrlSimSuggestDt =
         nextCtrlTime - imp_->timer_.simTime();
   } else {
@@ -648,6 +657,14 @@ auto SimulationLoop::resetRL() -> void {
   imp_->timer_.reset();
   imp_->prevCtrlTime_ = 0;
   imp_->prevIntTime_ = 0;
+  imp_->nextSuggestTime_ = -1;
+}
+auto SimulationLoop::resetRLNoTimer() -> void {
+  imp_->contact_pair_manager_.clear();
+  imp_->event_manager_->reset();
+  imp_->is_ctrl_flag_ = imp_->is_init_ctrl_;
+  imp_->prevCtrlTime_ = imp_->timer_.simTime();
+  imp_->prevIntTime_ = imp_->timer_.simTime();
   imp_->nextSuggestTime_ = -1;
 }
 auto SimulationLoop::resetRecorder() -> void {

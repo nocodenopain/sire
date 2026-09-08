@@ -1,5 +1,10 @@
 # Fixed-budget Sire CPU-parallelism experiment
 
+After the 2026-09-08 upstream integration, the solver, joint safety and training
+defaults differ from the original experiment. Reproduce historical runs at local
+commit `0b87a04`; use a new dated directory for the integrated version. Do not
+append new-backend evaluations to old results. Existing CSV aggregation is safe.
+
 Run from the Sire repository root. These scripts do not change physics or PPO.
 The only existing training-entry change is an opt-in measurement context.
 Do not run another training, evaluation, or heavy benchmark concurrently.

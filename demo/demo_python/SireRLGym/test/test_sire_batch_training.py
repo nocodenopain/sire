@@ -12,6 +12,7 @@ import torch
 import unittest
 
 from SireRLGym.utils.task_registry import make_env_cfg, make_env_from_cfg
+from SireRLGym.utils.math import quat_rotate_inverse
 
 
 def _make_env(num_envs: int = 2, threads: int = 2, rough_terrain: bool = False):
@@ -51,17 +52,88 @@ def _snapshot(env):
 
 
 class SireBatchTrainingTest(unittest.TestCase):
-    def test_go2_fall_penalty_excludes_timeout_transitions(self):
+    def test_effort_guard_and_joint_limit_method_are_configurable(self):
+        env = _make_env(num_envs=1, threads=1)
+        engine = env.sire_simulators[0].physicsEngine()
+        self.assertEqual(engine.jointLimitMethod, "shifted_ncp")
+        for method in ("projection", "disabled", "shifted_ncp"):
+            engine.jointLimitMethod = method
+            self.assertEqual(engine.jointLimitMethod, method)
+        # The ARIS reflection setter currently translates invalid C++ property
+        # values to RuntimeError, while direct pybind setters use ValueError.
+        with self.assertRaises((ValueError, RuntimeError)):
+            engine.jointLimitMethod = "unknown"
+
+        actuator = env.sire_models[0].motionPool()[int(env._motion_idx[0])]
+        actuator.desiredValue = 1e9
+        actuator.forward()
+        self.assertAlmostEqual(actuator.appliedValue, actuator.maxForce)
+
+        actuator.mp = actuator.maxPosition + 1e-3
+        actuator.mv = 1.0
+        self.assertTrue(actuator.enforcePositionLimits())
+        self.assertAlmostEqual(actuator.mp, actuator.maxPosition)
+        self.assertEqual(actuator.mv, 0.0)
+
+    def test_history_does_not_change_physics(self):
+        env = _make_env(num_envs=1, threads=1)
+        stepper = env._sire_batch_stepper
+        actions = np.zeros((1, env.num_actions), dtype=np.float32)
+        snapshots = []
+        for enabled in (True, False):
+            _reset_deterministically(env)
+            stepper.setHistoryRecording(enabled)
+            for _ in range(8):
+                stepper.step(actions)
+            snapshots.append([np.array(value, copy=True) for value in stepper.outputs()])
+        for recorded, unrecorded in zip(*snapshots):
+            np.testing.assert_allclose(recorded, unrecorded, rtol=1e-5, atol=1e-6)
+
+    def test_control_boundary_and_history_opt_in(self):
+        env = _make_env(num_envs=1, threads=1)
+        stepper = env._sire_batch_stepper
+        loop = env.sire_sim_loops[0]
+        actions = np.zeros((1, env.num_actions), dtype=np.float32)
+        for _ in range(3):
+            before = loop.simTime()
+            outputs = stepper.step(actions)
+            self.assertAlmostEqual(loop.simTime() - before, env.dt, delta=1e-6)
+            self.assertAlmostEqual(outputs[-1][0], loop.simTime() - before)
+            self.assertTrue(loop.headerIsCtrl())
+            self.assertEqual(len(loop.recordsToJson()['timeIndex']), 1)
+        state_before = np.array(stepper.outputs()[0], copy=True)
+        before = loop.simTime()
+        stepper.setHistoryRecording(True)
+        self.assertEqual(loop.simTime(), before)
+        np.testing.assert_array_equal(stepper.outputs()[0], state_before)
+        stepper.step(actions)
+        self.assertGreater(len(loop.recordsToJson()['timeIndex']), 1)
+        before = loop.simTime()
+        stepper.setHistoryRecording(False)
+        self.assertEqual(loop.simTime(), before)
+        stepper.step(actions)
+        self.assertEqual(len(loop.recordsToJson()['timeIndex']), 1)
+
+    def test_reset_refreshes_body_observations(self):
         env = _make_env()
-        env.reset_buf[:] = 1
-        env.time_out_buf[:] = torch.tensor([False, True])
-
-        termination_reward = (
-            env._reward_termination() * env.reward_scales["termination"]
-        )
-
-        self.assertAlmostEqual(float(termination_reward[0]), -1.0)
-        self.assertAlmostEqual(float(termination_reward[1]), 0.0)
+        env.base_lin_vel[:] = 99.0
+        env.base_ang_vel[:] = 99.0
+        env.projected_gravity[:] = 99.0
+        env.actions[:] = 1.0
+        ids = torch.tensor([1], device=env.device)
+        env.reset_idx(ids)
+        q = env.root_states[ids, 3:7]
+        torch.testing.assert_close(env.base_lin_vel[ids],
+                                   quat_rotate_inverse(q, env.root_states[ids, 7:10]))
+        torch.testing.assert_close(env.base_ang_vel[ids],
+                                   quat_rotate_inverse(q, env.root_states[ids, 10:13]))
+        torch.testing.assert_close(env.projected_gravity[ids],
+                                   quat_rotate_inverse(q, env.gravity_vec[ids]))
+        self.assertTrue(torch.all(env.base_lin_vel[0] == 99.0))
+        self.assertTrue(torch.all(env.actions[ids] == 0.0))
+        # Repeated IDs must not dispatch two workers against the same model.
+        env._sire_batch_stepper.reset(np.array([1, 1], dtype=np.int64))
+        self.assertEqual(env.sire_sim_loops[1].simTime(), 0.0)
 
     def test_batch_matches_legacy_step_and_reuses_outputs(self):
         # One environment isolates implementation equivalence from any
@@ -140,150 +212,6 @@ class SireBatchTrainingTest(unittest.TestCase):
         for expected in ("env_id=1", "sim_time=", "pq=[", "mp=[", "actions=["):
             self.assertIn(expected, message)
 
-    def test_safety_bound_divergence_resets_only_failed_environment(self):
-        env = _make_env()
-        actions = torch.zeros(env.num_envs, env.num_actions)
-        env.step(actions)
-        time_before = [loop.simTime() for loop in env.sire_sim_loops]
-
-        failed_base = env.sire_models[1].partPool()[1]
-        failed_pq = list(failed_base.pq)
-        failed_pq[0] = 101.0
-        failed_base.pq = failed_pq
-
-        _, _, rewards, dones, _ = env.step(actions)
-
-        self.assertFalse(bool(dones[0]))
-        self.assertTrue(bool(dones[1]))
-        self.assertTrue(bool(torch.isfinite(rewards).all()))
-        self.assertEqual(env._sire_physics_failure_count, 1)
-        self.assertGreater(env.sire_sim_loops[0].simTime(), time_before[0])
-        self.assertAlmostEqual(env.sire_sim_loops[1].simTime(), 0.0)
-        self.assertTrue(bool(torch.isfinite(env.obs_buf).all()))
-
-        # Recovery leaves the batch usable on the immediately following step.
-        env.step(actions)
-
-    def test_joint_divergence_is_recovered_without_reward_contamination(self):
-        env = _make_env()
-        actions = torch.zeros(env.num_envs, env.num_actions)
-        env.step(actions)
-        time_before = [loop.simTime() for loop in env.sire_sim_loops]
-
-        # This is finite, so it models the failure that previously escaped the
-        # NaN/Inf checks and made the unbounded dof_acc reward explode.
-        env.sire_models[1].motionPool()[0].mv = 3_000.0
-
-        _, _, rewards, dones, _ = env.step(actions)
-
-        self.assertFalse(bool(dones[0]))
-        self.assertTrue(bool(dones[1]))
-        self.assertEqual(float(rewards[1]), 0.0)
-        self.assertTrue(bool(env.extras["time_outs"][1]))
-        self.assertTrue(bool(torch.isfinite(rewards).all()))
-        self.assertEqual(env._sire_physics_failure_count, 1)
-        self.assertGreater(env.sire_sim_loops[0].simTime(), time_before[0])
-        self.assertAlmostEqual(env.sire_sim_loops[1].simTime(), 0.0)
-        self.assertTrue(
-            any(
-                "joint state exceeded configured safety bounds" in error
-                for error in env._sire_batch_stepper.recoverableErrors()
-            )
-        )
-        for values in env.episode_sums.values():
-            self.assertEqual(float(values[1]), 0.0)
-
-        # A numerical fault in one simulator must not poison or stop the batch.
-        env.step(actions)
-
-        # The companion position guard is deliberately wider than the normal
-        # mechanical clamp, so only an implausibly large excursion recovers.
-        upper = float(env.dof_pos_limits[0, 1])
-        env.sire_models[1].motionPool()[0].mp = upper + 1.01
-        _, _, rewards, dones, _ = env.step(actions)
-        self.assertTrue(bool(dones[1]))
-        self.assertEqual(float(rewards[1]), 0.0)
-        self.assertEqual(env._sire_physics_failure_count, 2)
-        self.assertTrue(
-            any(
-                "joint state exceeded configured safety bounds" in error
-                for error in env._sire_batch_stepper.recoverableErrors()
-            )
-        )
-
-    def test_go2_calf_limits_are_enforced_before_each_substep(self):
-        env = _make_env()
-        actions = torch.zeros(env.num_envs, env.num_actions)
-
-        calf_ids = [
-            i for i, name in enumerate(env.dof_names) if "calf_joint" in name
-        ]
-        self.assertEqual(len(calf_ids), 4)
-        for dof_id in calf_ids:
-            self.assertAlmostEqual(
-                float(env.dof_pos_limits[dof_id, 1]), -0.83776, places=5
-            )
-
-        # Sire does not currently import MJCF joint constraints.  A moderate
-        # finite overshoot is therefore clamped by the RL adapter before it
-        # can enter another 5 ms contact solve; truly divergent states still
-        # take the recoverable-error path covered by the preceding test.
-        dof_id = calf_ids[0]
-        motion_id = int(env._motion_idx[dof_id])
-        upper = float(env.dof_pos_limits[dof_id, 1])
-        motion = env.sire_models[1].motionPool()[motion_id]
-        motion.mp = upper + 0.25
-        motion.mv = 10.0
-
-        failures_before = env._sire_physics_failure_count
-        _, _, _, dones, _ = env.step(actions)
-
-        self.assertFalse(bool(dones[1]))
-        self.assertEqual(env._sire_physics_failure_count, failures_before)
-        self.assertLessEqual(float(env.dof_pos[1, dof_id]), upper + 1e-6)
-
-    def test_replay_history_is_opt_in_and_limited_to_one_env(self):
-        env = _make_env()
-        actions = torch.zeros(env.num_envs, env.num_actions)
-
-        self.assertEqual(env._sire_batch_stepper.recordingEnv, -1)
-        env.step(actions)
-        # Pure RL keeps only the continuation placeholder required by the
-        # contact solver; it does not accumulate replay frames.
-        for loop in env.sire_sim_loops:
-            self.assertEqual(len(loop.recordsToJson()["timeIndex"]), 1)
-
-        env.set_sire_recording_env(0)
-        self.assertEqual(env._sire_batch_stepper.recordingEnv, 0)
-        env.reset()
-        env.step(actions)
-        self.assertGreater(
-            len(env.sire_sim_loops[0].recordsToJson()["timeIndex"]), 1
-        )
-        self.assertEqual(len(env.sire_sim_loops[1].recordsToJson()["timeIndex"]), 1)
-
-        env.set_sire_recording_env(-1)
-        self.assertEqual(env._sire_batch_stepper.recordingEnv, -1)
-        env.step(actions)
-        for loop in env.sire_sim_loops:
-            self.assertEqual(len(loop.recordsToJson()["timeIndex"]), 1)
-
-    def test_pure_rl_does_not_accumulate_contact_solver_debug_records(self):
-        env = _make_env(num_envs=2, threads=2)
-        actions = torch.zeros(env.num_envs, env.num_actions)
-
-        for _ in range(20):
-            env.step(actions)
-
-        # PsVsSolver3 owns this debug JSON independently of Recorder.  It used
-        # to append two samples per contact solve for every environment and was
-        # the remaining long-run RSS leak in batched RL.
-        self.assertTrue(bool(torch.any(env.foot_ground_contact)))
-        for loop in env.sire_sim_loops:
-            records = loop.recordsContactCptInfo() or {}
-            self.assertEqual(len(records.get("currentTime", [])), 0)
-            self.assertEqual(len(records.get("minTime", [])), 0)
-
     def test_terrain_boundary_is_a_per_env_timeout(self):
         env = _make_env(rough_terrain=True)
         env.contact_forces.zero_()
@@ -295,6 +223,28 @@ class SireBatchTrainingTest(unittest.TestCase):
         self.assertFalse(bool(env.reset_buf[0]))
         self.assertTrue(bool(env.time_out_buf[1]))
         self.assertTrue(bool(env.reset_buf[1]))
+
+    def test_native_physics_failure_is_a_per_env_terminal(self):
+        env = _make_env()
+        env.contact_forces.zero_()
+        env.episode_length_buf.zero_()
+        env.root_states[:, 2] = 0.34
+        env._sire_physics_failure_buf.zero_()
+        env._sire_physics_failure_buf[1] = True
+
+        env.check_termination()
+
+        self.assertFalse(bool(env.reset_buf[0]))
+        self.assertTrue(bool(env.reset_buf[1]))
+        self.assertFalse(bool(env.time_out_buf[1]))
+
+    def test_go2_action_guard_limits_pd_target_offset(self):
+        env = _make_env(num_envs=1, threads=1)
+        self.assertEqual(env.cfg.normalization.clip_actions, 4.0)
+        self.assertLessEqual(
+            env.cfg.normalization.clip_actions * env.cfg.control.action_scale,
+            1.0,
+        )
 
     def test_low_base_is_a_per_env_fall_not_a_timeout(self):
         env = _make_env()

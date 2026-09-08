@@ -3,6 +3,7 @@
 //  Domain-specific bindings are in bindings_*.cpp
 // ═══════════════════════════════════════════════════════════════════
 #include <codecvt>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <locale>
@@ -30,7 +31,6 @@
 #include "sire/physics/collision/collision_detection.hpp"
 #include "sire/physics/collision/collision_filter.hpp"
 #include "sire/physics/contact/analytical_implicit_friction_solver.hpp"
-#include "sire/physics/contact/analytical_tangent_force_solver.hpp"
 #include "sire/physics/contact/contact_position_force_solver.hpp"
 #include "sire/physics/contact/contact_solver.hpp"
 #include "sire/physics/contact/ps_vs_solver.hpp"
@@ -61,6 +61,7 @@ void init_model(py::module& m);
 void init_core(py::module& m);
 
 PYBIND11_MODULE(sire, m) {
+  aris::core::setDefaultLogDirectory(std::filesystem::current_path() / "log");
   m.attr("kPosQuatSize") = sire::kPosQuatSize;
 
   py::register_exception_translator([](std::exception_ptr p) {

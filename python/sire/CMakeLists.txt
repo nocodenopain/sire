@@ -51,6 +51,7 @@ target_include_directories(sire
 # 链接库
 target_link_libraries(sire
   PRIVATE
+    sire_profiler
     sire_core
     sire_log
     sire_server
@@ -72,10 +73,28 @@ set_target_properties(sire PROPERTIES
   PREFIX ""
   LIBRARY_OUTPUT_DIRECTORY ${PYTHON_MODULE_OUTPUT_DIR}
 )
-if(WIN32)
-  set_target_properties(sire PROPERTIES SUFFIX ".pyd")
-else()
-  set_target_properties(sire PROPERTIES SUFFIX ".so")
+# Keep pybind11's Python ABI suffix (e.g. .cp313-win_amd64.pyd).
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # The staged/editable runtime no longer has the build-tree RPATH. Bundle
+  # Clarabel and the selected ARIS beside the extension, rather than requiring
+  # LD_LIBRARY_PATH or silently loading a different system ARIS. Keep installed
+  # search prefixes for coal and the other system-provided dependencies.
+  set_target_properties(sire PROPERTIES
+    INSTALL_RPATH "$ORIGIN"
+    INSTALL_RPATH_USE_LINK_PATH TRUE
+  )
+  if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(_sire_python_aris_target aris::debug::aris_lib)
+  else()
+    set(_sire_python_aris_target aris::aris_lib)
+  endif()
+  install(FILES
+    "$<TARGET_FILE:${_sire_python_aris_target}>"
+    "$<TARGET_PROPERTY:libclarabel_c_shared,SIRE_RUNTIME_FILE>"
+    DESTINATION "python/${CMAKE_BUILD_TYPE_LOWER}"
+    COMPONENT PythonRuntime
+  )
+  unset(_sire_python_aris_target)
 endif()
 
 # # 复制运行时依赖的 DLL 到输出目录（Windows 特有）
@@ -88,26 +107,14 @@ endif()
 # 安装 Python 模块
 install(TARGETS sire
   CONFIGURATIONS Release
-  DESTINATION "${CMAKE_INSTALL_PREFIX}/python/release"
+  DESTINATION "python/release"
+  COMPONENT PythonRuntime
 )
 
 install(TARGETS sire
   CONFIGURATIONS Debug
-  DESTINATION "${CMAKE_INSTALL_PREFIX}/python/debug"
+  DESTINATION "python/debug"
+  COMPONENT PythonRuntime
 )
 
-# # 安装依赖 DLL（可选）
-install(FILES
-  $<TARGET_FILE:sire_lib>
-  CONFIGURATIONS Debug
-  DESTINATION "${CMAKE_INSTALL_PREFIX}/python/debug"
-)
-
-# # 安装依赖 DLL（可选）
-install(FILES
-  $<TARGET_FILE:sire_lib>
-  CONFIGURATIONS Release
-  DESTINATION "${CMAKE_INSTALL_PREFIX}/python/release"
-)
-
-INSTALL_DLL(DESTINATION ${CMAKE_INSTALL_PREFIX}/python/${CMAKE_BUILD_TYPE_LOWER})
+INSTALL_DLL(DESTINATION python/${CMAKE_BUILD_TYPE_LOWER} COMPONENT PythonRuntime)

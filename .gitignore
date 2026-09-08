@@ -57,6 +57,7 @@ build/
 .reasonix/
 scripts/SireRLGym/logs/*
 **/logs/
+**/log/
 *.pt
 
 # for clion
@@ -99,6 +100,9 @@ trash/
 
 # simulation results log
 contact_solver_result.json
+solver_traces/
+tmp/
+log.txt
 *result.json
 motion_data/
 *.pdb
@@ -129,6 +133,7 @@ MUJOCO_LOG.txt
 
 # Local diagnostic note; intentionally never committed.
 /LOCAL_MEMORY_ISSUE.txt
+/python/src/sire/native/_runtime/
 
 # Local Codex run supervisors, resource samples, and diagnostic logs.
 /.codex_runs/

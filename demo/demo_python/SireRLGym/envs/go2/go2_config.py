@@ -58,6 +58,13 @@ class GO2RoughCfg(LeggedRobotCfg):
         friction_range = [0.2, 2.5]
         randomize_base_mass = True
         added_mass_range = [-0.5, 1.5]
+        # Sire material metadata needed to rebuild the per-environment pair
+        # while changing only friction.
+        sire_material_pair = ['m1', 'm1']
+        sire_contact_k = 2.0e8
+        sire_contact_d = 5.0e4
+        sire_contact_cr = 0.3
+        sire_threshold_velocity = 0.3
         push_robots = False
         push_interval_s = 5
         max_push_vel_xy = 0.5
@@ -69,6 +76,12 @@ class GO2RoughCfg(LeggedRobotCfg):
         action_scale = 0.25
         # 1 kHz physics / 20 = 50 Hz policy control (20 ms period).
         decimation = 20
+
+    class normalization(LeggedRobotCfg.normalization):
+        # With action_scale=0.25 this limits the PD position-target offset to
+        # +/-1 rad. The former +/-100 guard allowed a saturated policy to ask
+        # for targets tens of radians beyond the physical joint range.
+        clip_actions = 4.0
 
     class asset(LeggedRobotCfg.asset):
         file = '{LEGGED_GYM_ROOT_DIR}/resources/robots/go2/flat.xml'
@@ -87,14 +100,12 @@ class GO2RoughCfg(LeggedRobotCfg):
         base_height_target = 0.34
 
         class scales(LeggedRobotCfg.rewards.scales):
-            # Reward scales are integrated over the 20 ms control interval.
-            # -50 therefore gives an actual -1 reward for an ordinary fall,
-            # while time-limit and recoverable simulator truncations remain
-            # excluded by _reward_termination().
-            termination = -50.0
             torques = -0.0001
             dof_pos_limits = -10.0
             action_rate = -0.01
+            # Penalize a constant saturated command, which action_rate alone
+            # cannot see once two consecutive actions are equal.
+            action_magnitude = -0.001
             orientation = -5.0
             base_height = -10.0
             dof_vel = -5.0e-4

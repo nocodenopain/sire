@@ -6,7 +6,6 @@ import os
 import re
 import statistics
 import time
-import gc
 from collections import deque
 from pathlib import Path
 
@@ -102,6 +101,7 @@ from rsl_rl.algorithms import PPO
 from rsl_rl.modules import ActorCritic
 
 from SireRLGym.runners.infinite_scheduler import InfiniteLevelScheduler
+from SireRLGym.utils.memory_probe import write_memory_sample
 from SireRLGym.utils.helpers import class_to_dict
 from SireRLGym.utils.joint_order import JointOrderAdapter
 
@@ -132,20 +132,21 @@ class OnPolicyRunner:
         self.num_steps_per_env = self.cfg['num_steps_per_env']
         self.save_interval = self.cfg['save_interval']
         self.debug_reward = bool(self.cfg.get('debug_reward', False))
+        self.log_interval = int(self.cfg.get('log_interval', 10))
+        self.memory_interval = int(self.cfg.get('memory_interval', 0))
+        if self.log_interval < 0 or self.memory_interval < 0:
+            raise ValueError('log_interval and memory_interval must be nonnegative')
+        self.memory_path = os.path.join(log_dir or '.', 'memory.jsonl')
         self.log_episode_keys = self.cfg.get('log_episode_keys')
         self.infinite_mode = bool(self.cfg.get('infinite_mode', False))
         self.infinite_scheduler = (
             InfiniteLevelScheduler(self.env, self.cfg, log_dir=log_dir) if self.infinite_mode else None
         )
         self.visualize_interval = self.cfg.get('visualize_interval', None)
+        if self.visualize_interval is not None and self.visualize_interval <= 0:
+            raise ValueError('visualize_interval must be positive')
+        self.env.setSireHistoryRecording(False)
         self.visualize_resource_path = self.cfg.get('visualize_resource_path', None)
-        self.replay_history_enabled = (
-            self.visualize_interval is not None
-            or bool(getattr(self.env.cfg.sim, 'sire_diagnostics', False))
-        )
-        self.recording_policy_applied = self.env.set_sire_recording_env(
-            0 if self.replay_history_enabled else -1
-        )
         self.vis_dir = os.path.join(log_dir, 'vis') if log_dir else None
         if self.vis_dir:
             os.makedirs(self.vis_dir, exist_ok=True)
@@ -235,11 +236,15 @@ class OnPolicyRunner:
         total_iterations = None if self.infinite_mode else (self.current_learning_iteration + num_learning_iterations)
         while self.infinite_mode or it < total_iterations:
             it += 1
+            record_rollout = (self.visualize_interval is not None
+                              and it % self.visualize_interval == 0)
+            self.env.setSireHistoryRecording(record_rollout)
+            sample_memory = self.memory_interval > 0 and it % self.memory_interval == 0
+            if sample_memory:
+                write_memory_sample(self.memory_path, it, 'before_rollout')
             start = time.time()
             max_abs_dof_velocity = 0.0
-            physics_failures_before = int(
-                getattr(self.env, '_sire_physics_failure_count', 0)
-            )
+            physics_failures_before = self._physics_recovery_total()
             iteration_episode_returns = []
 
             if self.experiment_observer is not None:
@@ -284,6 +289,8 @@ class OnPolicyRunner:
                 self.alg.compute_returns(critic_obs)
                 rollout_diagnostics = self._capture_rollout_diagnostics()
 
+            if sample_memory:
+                write_memory_sample(self.memory_path, it, 'after_rollout')
             update_out = self.alg.update()
             if self.experiment_observer is not None:
                 self.experiment_observer.update_end()
@@ -306,11 +313,11 @@ class OnPolicyRunner:
                 mean_entropy = self._policy_entropy()
                 mean_sym_loss = None
             optimizer_diagnostics = self._capture_optimizer_diagnostics()
-            physics_recoveries = int(
-                getattr(self.env, '_sire_physics_failure_count', 0)
-            ) - physics_failures_before
+            physics_recoveries = self._physics_recovery_total() - physics_failures_before
             stop = time.time()
             learn_time = stop - start
+            if sample_memory:
+                write_memory_sample(self.memory_path, it, 'after_update')
 
             if self.experiment_observer is not None:
                 self.experiment_observer.iteration_end(
@@ -321,15 +328,15 @@ class OnPolicyRunner:
                 self.log(locals())
             if it % self.save_interval == 0:
                 self.save(os.path.join(self.log_dir, f'model_{it}.pt'), iteration=it)
-            if self.visualize_interval is not None and it % self.visualize_interval == 0:
+            if record_rollout:
                 self._save_recording(it)
-            if self.replay_history_enabled or not self.recording_policy_applied:
-                # A PPO rollout boundary is not an episode boundary. Preserve
-                # simulator/model/timer state and clear only replay storage.
+            # A PPO rollout boundary is not an episode boundary.  Preserve all
+            # simulator/model/timer state and clear only recorder storage.
+            if record_rollout:
                 self.env.resetSireRecorders()
-            # Force GC to release pybind11-held C++ wrappers (motionPool, partPool, etc.)
-            if it % 5 == 0:
-                gc.collect()
+                self.env.setSireHistoryRecording(False)
+            if sample_memory:
+                write_memory_sample(self.memory_path, it, 'after_recorder_clear')
             stop_training = False
             transitioned_level = False
             if self.infinite_scheduler is not None:
@@ -422,6 +429,10 @@ class OnPolicyRunner:
         std = self.alg.actor_critic.std.detach().float().clamp_min(1e-12)
         return float((torch.log(std) + 0.5 * math.log(2.0 * math.pi * math.e)).sum().item())
 
+    def _physics_recovery_total(self):
+        stepper = getattr(self.env, '_sire_batch_stepper', None)
+        return int(getattr(stepper, 'totalRecoveredFailures', 0))
+
     def close(self):
         if self.writer is not None:
             self.writer.close()
@@ -430,6 +441,8 @@ class OnPolicyRunner:
     def log(self, locs, width=80, pad=35):
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
         self.tot_time += locs['collection_time'] + locs['learn_time']
+        if self.log_interval == 0 or locs['it'] % self.log_interval != 0:
+            return
         iteration_time = locs['collection_time'] + locs['learn_time']
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs['collection_time'] + locs['learn_time']))
 
@@ -484,7 +497,7 @@ class OnPolicyRunner:
         )
         self.writer.add_scalar(
             'Diagnostics/physics_recoveries_total',
-            int(getattr(self.env, '_sire_physics_failure_count', 0)),
+            self._physics_recovery_total(),
             locs['it'],
         )
         for key, value in locs.get('rollout_diagnostics', {}).items():
