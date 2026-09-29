@@ -65,14 +65,27 @@ cmake --build build --parallel
 
 ### GO2 强化学习控制
 
-<p align="center">
-  <a href="docs/media/go2-sire-demo.webm">
-    <img src="docs/media/go2-sire-demo.gif" alt="GO2 策略在 Sire 中运行的可视化演示" width="92%" />
-  </a>
-</p>
+<table align="center">
+  <tr>
+    <td align="center" width="50%">
+      <a href="docs/media/go2-sire-demo.webm">
+        <img src="docs/media/go2-sire-demo.gif" alt="GO2 策略在 Sire 仿真中运行的可视化演示" width="100%" />
+      </a>
+    </td>
+    <td align="center" width="50%">
+      <a href="docs/media/go2-real-robot.webm">
+        <img src="docs/media/go2-real-robot.gif" alt="GO2 策略在真机上的实拍演示" width="100%" />
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center"><sub><strong>仿真</strong> — GO2 策略在 Sire 中运行</sub></td>
+    <td align="center"><sub><strong>真机</strong> — 同一策略部署到 Unitree GO2</sub></td>
+  </tr>
+</table>
 
 <p align="center">
-  <sub>GO2 策略在 Sire 中的可视化运行效果。点击动图可查看完整 WebM 录屏。</sub>
+  <sub>同一策略在 Sire 仿真与真机上的运行效果。点击任一画面可查看完整 WebM 录屏。</sub>
 </p>
 
 ### 论文实验

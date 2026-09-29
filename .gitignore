@@ -131,6 +131,10 @@ MUJOCO_LOG.txt
 !/docs/media/*.gif
 !/docs/media/*.webm
 
+# Raw full-resolution capture sources. Kept on disk for re-encoding only:
+# they exceed GitHub's file size limit. Commit the derived .gif/.webm instead.
+/docs/media/real.mp4
+
 # Local diagnostic note; intentionally never committed.
 /LOCAL_MEMORY_ISSUE.txt
 /python/src/sire/native/_runtime/
