@@ -80,7 +80,7 @@ cmake --build build --parallel
   </tr>
   <tr>
     <td align="center"><sub><strong>仿真</strong> — GO2 策略在 Sire 中运行</sub></td>
-    <td align="center"><sub><strong>真机</strong> — 同一策略部署到 Unitree GO2</sub></td>
+    <td align="center"><sub><strong>真机</strong> — 策略部署到 Unitree GO2</sub></td>
   </tr>
 </table>
 
